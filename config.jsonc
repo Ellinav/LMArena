@@ -1,0 +1,30 @@
+{
+  // 版本号，用于更新检查
+  "version": "2.3.0",
+
+  // --- 功能开关 ---
+  // 是否启用绕过模式
+  "bypass_enabled": true,
+  // 是否启用酒馆模式 (为SillyTavern等设计)
+  "tavern_mode_enabled": false,
+
+  // --- 更新与重启设置 ---
+  // 在云端部署时，建议关闭自动更新，手动管理版本
+  "enable_auto_update": false,
+  // 是否启用空闲自动重启
+  "enable_idle_restart": true,
+  // 空闲重启的超时时间（秒）。-1为禁用。例如30分钟是1800秒。
+  "idle_restart_timeout_seconds": 1800,
+
+  // --- 高级设置 ---
+  // 流式响应的超时时间
+  "stream_response_timeout_seconds": 360,
+
+  // --- 安全设置 ---
+  // API Key，如果设置了，SillyTavern中必须填写
+  "api_key": "",
+
+  // --- 模式配置 (仍然被用于决定消息的参与者位置) ---
+  "id_updater_last_mode": "direct_chat",
+  "id_updater_battle_target": "A"
+}
