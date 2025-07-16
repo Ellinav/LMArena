@@ -1,0 +1,45 @@
+# .github/workflows/docker-publish.yml
+
+name: Build and Publish Docker Image to GHCR
+
+# 1. 触发器：每当有代码推送到 main 分支时，此工作流就会运行
+on:
+  push:
+    branches: [ "main" ]
+
+# 2. 定义环境变量，方便修改
+env:
+  # 将这里的 USERNAME 和 REPO_NAME 修改为你自己的
+  IMAGE_NAME: ghcr.io/ellinav/lmarena
+
+# 3. 工作任务
+jobs:
+  build_and_push:
+    name: Build and Push to GHCR
+    runs-on: ubuntu-latest # 使用最新的Ubuntu环境来运行
+
+    # 4. 授予工作流写入GitHub Packages的权限
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # 5. 第一步：检出你的仓库代码
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      # 6. 第二步：登录到GitHub容器镜像仓库 (GHCR)
+      - name: Log in to the Container registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 7. 第三步：构建Docker镜像并推送到GHCR
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: . # 使用当前目录作为构建上下文
+          push: true # 确认要推送镜像
+          tags: ${{ env.IMAGE_NAME }}:latest # 给镜像打上标签，例如 ghcr.io/user/repo:latest
