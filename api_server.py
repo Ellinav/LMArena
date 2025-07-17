@@ -79,9 +79,9 @@ def load_model_map():
 # --- 模型更新 ---
 def extract_models_from_html(html_content):
     """
-    从 HTML 内容中提取模型数据（最终版）。
-    此版本能够处理 `self.__next_f.push` 载荷中的流式、多行JSON数据格式，
-    通过逐行扫描定位并解析包含 'initialModels' 的关键数据行。
+    从 HTML 内容中提取模型数据（最终版 V4）。
+    此版本使用高精度正则表达式，直接定位到包含 "initialModels" 关键字的
+    目标脚本块，然后再用流式解析方法处理，以确保准确性。
     """
     
     # 辅助函数，用于在复杂的JSON对象中递归查找 'initialModels'。此函数本身是正确的。
@@ -103,47 +103,41 @@ def extract_models_from_html(html_content):
         return None
 
     try:
-        # 1. 定位到包含数据流的脚本块
-        script_match = re.search(r'<script>self\.__next_f\.push\(\[1,"(.*)"\]\)</script>', html_content, re.DOTALL)
+        # 1. 【核心修改】使用高精度正则表达式，它要求捕获的组内必须含有 "initialModels"
+        # 这可以确保我们从多个 self.__next_f.push 中选中唯一正确的那一个。
+        script_match = re.search(r'self\.__next_f\.push\(\[1,"(.*\"initialModels\".*)"\]\)', html_content, re.DOTALL)
+        
         if not script_match:
-            logger.error("解析错误：在HTML中找不到 'self.__next_f.push' 脚本块。")
+            logger.error("❌ [V4] 解析失败：在HTML中找不到任何包含 'initialModels' 的 'self.__next_f.push' 脚本块。")
             return None
 
         # 2. 提取出包含所有数据行的原始载荷字符串
         payload_with_escapes = script_match.group(1)
         
         # 3. 将整个数据流按换行符 `\n` 分割成多行
-        # 注意：在原始字符串中，换行符被转义为 '\\n'
         lines = payload_with_escapes.split('\\n')
 
         # 4. 逐行扫描，寻找包含模型数据的那一行
         for line in lines:
-            # 目标行一定包含 "initialModels" 这个关键词
             if '"initialModels"' in line:
                 try:
-                    # 该行的数据格式通常是 '5:[...]'，我们需要冒号后面的部分
                     json_start_index = line.find(':')
                     if json_start_index == -1:
-                        continue # 如果行格式不对，跳过
+                        continue
 
-                    # 提取可能包含JSON的字符串部分
                     json_data_string = line[json_start_index + 1:]
-                    
-                    # 对这一行单独进行JSON反转义和解析
                     json_data_string_unescaped = json_data_string.replace('\\"', '"')
                     data = json.loads(json_data_string_unescaped)
                     
-                    # 在解析成功的数据中寻找模型列表
                     models = find_initial_models_recursively(data)
                     if models:
-                        logger.info(f"✅ [最终版解析成功] 成功从 'initialModels' 数据行中提取到 {len(models)} 个模型。")
+                        logger.info(f"✅ [V4] 成功从 'initialModels' 数据行中提取到 {len(models)} 个模型。")
                         return models
                 except Exception:
-                    # 如果解析某一行失败，不要终止整个过程，继续尝试下一行
                     continue
         
-        # 5. 如果遍历完所有行都没有找到，则报告失败
-        logger.error("❌ 解析失败：遍历所有数据行后，未能找到或解析包含 'initialModels' 的有效数据。")
+        # 5. 这段代码理论上不应该被执行，因为正则已经保证了 'initialModels' 的存在
+        logger.error("❌ [V4] 逻辑错误：找到了包含'initialModels'的脚本块，但在其中解析数据失败。")
         return None
 
     except Exception as e:
