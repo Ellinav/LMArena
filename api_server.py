@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, Response, HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 
 # --- 导入自定义模块 ---
 from modules import image_generation
@@ -24,11 +24,9 @@ browser_ws: WebSocket | None = None
 response_channels: dict[str, asyncio.Queue] = {}
 last_activity_time = None
 idle_monitor_thread = None
-WARNED_UNKNOWN_IDS = set()
 main_event_loop = None
 MODEL_NAME_TO_ID_MAP = {}
 MODEL_ENDPOINT_MAP = {}
-DEFAULT_MODEL_ID = "f44e280a-7914-43ca-a25d-ecfcc5d48d09"
 
 class EndpointUpdatePayload(BaseModel):
     model_name: str = Field(..., alias='modelName')
@@ -37,20 +35,9 @@ class EndpointUpdatePayload(BaseModel):
     mode: str
     battle_target: Optional[str] = Field(None, alias='battleTarget')
 
-def load_model_endpoint_map():
-    global MODEL_ENDPOINT_MAP
-    try:
-        with open('model_endpoint_map.json', 'r', encoding='utf-8') as f:
-            content = f.read()
-            if not content.strip(): MODEL_ENDPOINT_MAP = {}
-            else: MODEL_ENDPOINT_MAP = json.loads(content)
-        logger.info(f"成功从 'model_endpoint_map.json' 加载了 {len(MODEL_ENDPOINT_MAP)} 个模型端点映射。")
-    except FileNotFoundError:
-        logger.warning("'model_endpoint_map.json' 文件未找到。将使用空映射。")
-        MODEL_ENDPOINT_MAP = {}
-    except json.JSONDecodeError as e:
-        logger.error(f"加载或解析 'model_endpoint_map.json' 失败: {e}。将使用空映射。")
-        MODEL_ENDPOINT_MAP = {}
+class DeletePayload(BaseModel):
+    model_name: str = Field(..., alias='modelName')
+    session_id: str = Field(..., alias='sessionId')
 
 def load_config():
     global CONFIG
@@ -60,10 +47,8 @@ def load_config():
             json_content = re.sub(r'//.*|/\*[\s\S]*?\*/', '', content)
             CONFIG = json.loads(json_content)
         logger.info("成功从 'config.jsonc' 加载配置。")
-        logger.info(f"  - 酒馆模式 (Tavern Mode): {'✅ 启用' if CONFIG.get('tavern_mode_enabled') else '❌ 禁用'}")
-        logger.info(f"  - 绕过模式 (Bypass Mode): {'✅ 启用' if CONFIG.get('bypass_enabled') else '❌ 禁用'}")
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        logger.error(f"加载或解析 'config.jsonc' 失败: {e}。将使用默认配置。")
+    except Exception as e:
+        logger.error(f"加载 'config.jsonc' 失败: {e}。将使用空配置。")
         CONFIG = {}
 
 def load_model_map():
@@ -71,146 +56,31 @@ def load_model_map():
     try:
         with open('models.json', 'r', encoding='utf-8') as f:
             MODEL_NAME_TO_ID_MAP = json.load(f)
-        logger.info(f"成功从 'models.json' 加载了 {len(MODEL_NAME_TO_ID_MAP)} 个模型。")
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        logger.error(f"加载 'models.json' 失败: {e}。将使用空模型列表。")
+        logger.info(f"✅ [稳定版] 成功从 'models.json' 加载了 {len(MODEL_NAME_TO_ID_MAP)} 个模型。这是唯一的模型数据源。")
+    except Exception as e:
+        logger.error(f"加载 'models.json' 失败: {e}。模型列表将为空。请确保该文件存在且格式正确。")
         MODEL_NAME_TO_ID_MAP = {}
 
-# --- 模型更新 ---
-def extract_models_from_html(html_content):
-    """
-    从 HTML 内容中提取模型数据（最终版 V5 - 稳健版）。
-    此版本放弃单一复杂正则，改为遍历所有脚本块，通过关键词筛选定位，
-    然后再对目标块进行解析，以应对潜在的HTML结构细微差异。
-    """
-    
-    # 辅助函数，用于在复杂的JSON对象中递归查找 'initialModels'。此函数本身是正确的。
-    def find_initial_models_recursively(data):
-        if isinstance(data, dict):
-            if 'initialModels' in data and isinstance(data['initialModels'], list):
-                model_list = data['initialModels']
-                if model_list and isinstance(model_list[0], dict) and 'publicName' in model_list[0]:
-                    return model_list
-            for value in data.values():
-                result = find_initial_models_recursively(value)
-                if result is not None:
-                    return result
-        elif isinstance(data, list):
-            for item in data:
-                result = find_initial_models_recursively(item)
-                if result is not None:
-                    return result
-        return None
-
+def load_model_endpoint_map():
+    global MODEL_ENDPOINT_MAP
     try:
-        # 1. "广撒网": 找到页面上所有的<script>标签内容
-        all_scripts_content = re.findall(r'<script>(.*?)</script>', html_content, re.DOTALL)
-        
-        target_script_content = None
-        # 2. "关键词筛选": 遍历所有脚本，找到我们唯一的目标
-        for script_content in all_scripts_content:
-            if 'self.__next_f.push' in script_content and 'initialModels' in script_content:
-                target_script_content = script_content
-                break  # 找到就停止
-
-        if not target_script_content:
-            logger.error("❌ [V5] 解析失败：遍历了所有<script>标签，但未找到同时包含 'self.__next_f.push' 和 'initialModels' 的目标脚本。")
-            return None
-
-        # 3. "精确解析": 只针对找到的正确脚本内容进行处理
-        payload_match = re.search(r'self\.__next_f\.push\(\[1,"(.*)"\]\)', target_script_content, re.DOTALL)
-        if not payload_match:
-            logger.error("❌ [V5] 找到了目标脚本块，但无法从中用正则提取载荷。")
-            return None
-
-        payload_with_escapes = payload_match.group(1)
-        lines = payload_with_escapes.split('\\n')
-
-        for line in lines:
-            if '"initialModels"' in line:
-                try:
-                    json_start_index = line.find(':')
-                    if json_start_index == -1: continue
-                    
-                    json_data_string = line[json_start_index + 1:].replace('\\"', '"')
-                    data = json.loads(json_data_string)
-                    models = find_initial_models_recursively(data)
-                    
-                    if models:
-                        logger.info(f"✅ [V5] 成功! 已从目标脚本中提取到 {len(models)} 个模型。")
-                        return models
-                except Exception:
-                    continue
-        
-        logger.error("❌ [V5] 找到了目标脚本和载荷，但在载荷中解析 'initialModels' 数据时失败。")
-        return None
-
+        with open('model_endpoint_map.json', 'r', encoding='utf-8') as f:
+            content = f.read()
+            MODEL_ENDPOINT_MAP = json.loads(content) if content.strip() else {}
+        logger.info(f"成功从 'model_endpoint_map.json' 加载了 {len(MODEL_ENDPOINT_MAP)} 个模型端点映射。")
     except Exception as e:
-        logger.error(f"提取模型时发生未知错误: {e}", exc_info=True)
-        return None
+        logger.warning(f"加载或解析 'model_endpoint_map.json' 失败: {e}。将使用空映射。")
+        MODEL_ENDPOINT_MAP = {}
 
-def compare_and_update_models(new_models_list, models_path):
-    """
-    比较新旧模型列表，打印差异，并用新列表更新本地 models.json 文件。
-    """
-    try:
-        with open(models_path, 'r', encoding='utf-8') as f:
-            old_models = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        old_models = {}
-
-    new_models_dict = {model['publicName']: model for model in new_models_list if 'publicName' in model}
-    old_models_set = set(old_models.keys())
-    new_models_set = set(new_models_dict.keys())
-
-    added_models = new_models_set - old_models_set
-    removed_models = old_models_set - new_models_set
-    
-    logger.info("--- 模型列表更新检查 ---")
-    has_changes = False
-
-    if added_models:
-        has_changes = True
-        logger.info("\n[+] 新增模型:")
-        for name in sorted(list(added_models)):
-            model = new_models_dict[name]
-            logger.info(f"  - 名称: {name}, ID: {model.get('id')}, 组织: {model.get('organization', 'N/A')}")
-
-    if removed_models:
-        has_changes = True
-        logger.info("\n[-] 删除模型:")
-        for name in sorted(list(removed_models)):
-            logger.info(f"  - 名称: {name}, ID: {old_models.get(name)}")
-
-    logger.info("\n[*] 共同模型检查:")
-    changed_models = 0
-    for name in sorted(list(new_models_set.intersection(old_models_set))):
-        new_id = new_models_dict[name].get('id')
-        old_id = old_models.get(name)
-        if new_id != old_id:
-            has_changes = True
-            changed_models += 1
-            logger.info(f"  - ID 变更: '{name}' 旧ID: {old_id} -> 新ID: {new_id}")
-    
-    if changed_models == 0:
-        logger.info("  - 共同模型的ID无变化。")
-
-    if not has_changes:
-        logger.info("\n结论: 模型列表无任何变化，无需更新文件。")
-        logger.info("--- 检查完毕 ---")
-        return
-
-    logger.info("\n结论: 检测到模型变更，正在更新 'models.json'...")
-    updated_model_map = {model['publicName']: model.get('id') for model in new_models_list if 'publicName' in model and 'id' in model}
-    try:
-        with open(models_path, 'w', encoding='utf-8') as f:
-            json.dump(updated_model_map, f, indent=4, ensure_ascii=False)
-        logger.info(f"'{models_path}' 已成功更新，包含 {len(updated_model_map)} 个模型。")
-        load_model_map()
-    except IOError as e:
-        logger.error(f"写入 '{models_path}' 文件时出错: {e}")
-    
-    logger.info("--- 检查与更新完毕 ---")
+async def send_pings():
+    while True:
+        await asyncio.sleep(30)
+        if browser_ws:
+            try:
+                await browser_ws.send_text(json.dumps({"command": "ping"}))
+                logger.debug("Ping sent.")
+            except Exception:
+                logger.debug("Ping发送失败，连接可能已关闭。")
 
 def restart_server():
     logger.warning("="*60)
@@ -243,31 +113,25 @@ def idle_monitor():
                 break
         time.sleep(10)
 
-async def send_pings():
-    while True:
-        await asyncio.sleep(30)
-        if browser_ws:
-            try:
-                await browser_ws.send_text(json.dumps({"command": "ping"}))
-                logger.debug("Ping sent.")
-            except Exception:
-                logger.debug("Ping发送失败，连接可能已关闭。")
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global main_event_loop, last_activity_time, idle_monitor_thread
     main_event_loop = asyncio.get_running_loop()
     load_config()
-    load_model_map()
+    load_model_map() # <--- 唯一的模型加载点
     load_model_endpoint_map()
+    
     logger.info("服务器启动完成。等待油猴脚本连接...")
-    asyncio.create_task(send_pings())
+    
+    asyncio.create_task(send_pings()) # 启动心跳
     logger.info("已启动WebSocket心跳维持任务。")
+
+    # 启动闲置监控
     last_activity_time = datetime.now()
     if CONFIG.get("enable_idle_restart", False):
         idle_monitor_thread = threading.Thread(target=idle_monitor, daemon=True)
         idle_monitor_thread.start()
-    image_generation.initialize_image_module(logger, response_channels, CONFIG, MODEL_NAME_TO_ID_MAP, DEFAULT_MODEL_ID)
+        
     yield
     logger.info("服务器正在关闭。")
 
@@ -327,101 +191,45 @@ async def import_map(request: Request):
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
 
-# (在 api_server.py 中找到旧的 update_models_endpoint 函数并用下面的“调试版”代码完全替换它)
-
-@app.post("/update_models")
-async def update_models_endpoint(request: Request):
-    """
-    【调试专用版】
-    接收来自油猴脚本的页面 HTML，如果解析失败，则将接收到的HTML内容片段打印到日志中，
-    以便我们分析为什么关键数据找不到。
-    """
-    html_content_bytes = await request.body()
-    html_content = ""
-    try:
-        if not html_content_bytes:
-            logger.warning("模型更新请求未收到任何 HTML 内容。")
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "message": "No HTML content received."}
-            )
-        
-        html_content = html_content_bytes.decode('utf-8')
-        logger.info("收到页面内容，开始更新内存中的模型列表...")
-        new_models_list = extract_models_from_html(html_content)
-
-        if new_models_list:
-            # (如果成功，这里的逻辑和之前一样)
-            global MODEL_NAME_TO_ID_MAP
-            new_model_map = {
-                model['publicName']: model.get('id') 
-                for model in new_models_list 
-                if 'publicName' in model and 'id' in model
-            }
-            MODEL_NAME_TO_ID_MAP = new_model_map
-            logger.info(f"✅ [调试版] 成功在内存中更新了模型列表，共 {len(MODEL_NAME_TO_ID_MAP)} 个模型。")
-            return JSONResponse({"status": "success", "message": "Model list updated."})
-        else:
-            # 这是关键：如果解析失败，会走到这里
-            logger.error("未能从 HTML 中成功提取模型数据。")
-            raise ValueError("Extraction failed, entering debug log.")
-
-    except Exception as e:
-        # 【【【 调试日志打印 】】】
-        # 无论因为什么原因失败，我们都在这里打印收到的HTML内容
-        logger.error(f"捕获到异常 '{e}'，现在打印接收到的HTML内容以供调试。")
-        logger.info("="*20 + " DEBUG HTML START " + "="*20)
-        # 我们只打印前 8000 个字符，避免日志过长，但通常足够分析了
-        logger.info(html_content[:8000])
-        logger.info("="*20 + "  DEBUG HTML END  " + "="*20)
-        
-        # 仍然像之前一样返回错误，以便浏览器端知道失败了
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": "Could not extract model data from HTML. Debug info logged on server."}
-        )
-
 # --- WebSocket 端点 (整合了所有稳定版逻辑) ---
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    global browser_ws, WARNED_UNKNOWN_IDS
+    global browser_ws
     await websocket.accept()
-    if browser_ws: logger.warning("检测到新的油猴脚本连接，旧的连接将被替换。")
-    WARNED_UNKNOWN_IDS.clear()
+    if browser_ws:
+        logger.warning("检测到新的油猴脚本连接，旧的连接将被替换。")
+    
     logger.info("✅ 油猴脚本已成功连接 WebSocket。")
     try:
         await websocket.send_text(json.dumps({"status": "connected"}))
-    except Exception as e:
-        logger.error(f"发送 'connected' 状态失败: {e}")
+    except Exception: pass
+    
     browser_ws = websocket
     try:
         while True:
             message_str = await websocket.receive_text()
             message = json.loads(message_str)
+
+            # 处理心跳响应
             if message.get("status") == "pong":
-                logger.debug("Pong received from client.")
                 continue
+
+            # 处理服务器指令
+            if message.get("command") in ["reconnect", "refresh"]:
+                continue
+
+            # 处理聊天/图像生成请求
             request_id = message.get("request_id")
             data = message.get("data")
-            if not request_id or data is None:
-                logger.warning(f"收到来自浏览器的无效消息: {message}")
-                continue
-            if request_id in response_channels:
+            if request_id and data is not None and request_id in response_channels:
                 await response_channels[request_id].put(data)
-            else:
-                if request_id not in WARNED_UNKNOWN_IDS:
-                    logger.warning(f"⚠️ 收到未知或已关闭请求的响应: {request_id}。")
-                    WARNED_UNKNOWN_IDS.add(request_id)
+
     except WebSocketDisconnect:
         logger.warning("❌ 油猴脚本客户端已断开连接。")
-        if response_channels:
-            logger.warning(f"WebSocket 连接断开！正在清理 {len(response_channels)} 个待处理的请求通道...")
-    except Exception as e:
-        logger.error(f"WebSocket 处理时发生未知错误: {e}", exc_info=True)
     finally:
         browser_ws = None
         for queue in response_channels.values():
-            await queue.put({"error": "Browser disconnected during operation"})
+            await queue.put({"error": "Browser disconnected"})
         response_channels.clear()
         logger.info("WebSocket 连接已清理。")
 
