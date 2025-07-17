@@ -596,21 +596,33 @@ async def delete_endpoint(payload: DeletePayload, username: str = Depends(get_cu
     """根据模型名和Session ID删除一个指定的端点"""
     global MODEL_ENDPOINT_MAP
     model_name = payload.model_name
-    session_id = payload.session_id
+    session_id_to_delete = payload.session_id
 
+    # 检查模型是否存在，并且其值是一个列表
     if model_name in MODEL_ENDPOINT_MAP and isinstance(MODEL_ENDPOINT_MAP[model_name], list):
         endpoints = MODEL_ENDPOINT_MAP[model_name]
-        # 找到并移除匹配的端点
         original_len = len(endpoints)
-        MODEL_ENDPOINT_MAP[model_name] = [ep for ep in endpoints if ep.get('sessionId') != session_id]
+
+        # 【【【 核心修复逻辑 】】】
+        # 新的过滤逻辑，能同时兼容 'sessionId' 和 'session_id' 两种键名
+        filtered_endpoints = [
+            ep for ep in endpoints 
+            if ep.get('sessionId', ep.get('session_id')) != session_id_to_delete
+        ]
         
-        if len(MODEL_ENDPOINT_MAP[model_name]) < original_len:
-            # 如果列表变空，则从字典中移除该模型
-            if not MODEL_ENDPOINT_MAP[model_name]:
+        # 如果列表长度变短，说明删除成功
+        if len(filtered_endpoints) < original_len:
+            # 如果删除后列表为空，则从字典中移除整个模型条目
+            if not filtered_endpoints:
                 del MODEL_ENDPOINT_MAP[model_name]
-            logger.info(f"成功从模型 '{model_name}' 中删除了 Session ID 为 ...{session_id[-6:]} 的端点。")
+                logger.info(f"模型 '{model_name}' 的最后一个端点已删除，该模型条目已移除。")
+            else:
+                MODEL_ENDPOINT_MAP[model_name] = filtered_endpoints
+                logger.info(f"成功从模型 '{model_name}' 中删除了 Session ID 为 ...{session_id_to_delete[-6:]} 的端点。")
+            
             return {"status": "success", "message": "Endpoint deleted."}
 
+    # 如果上述条件都不满足，则说明未找到要删除的条目
     logger.warning(f"删除失败：未找到模型 '{model_name}' 或对应的 Session ID。")
     raise HTTPException(status_code=404, detail="Endpoint not found")
 
