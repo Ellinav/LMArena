@@ -79,56 +79,73 @@ def load_model_map():
 # --- 模型更新 ---
 def extract_models_from_html(html_content):
     """
-    从 HTML 内容中提取模型数据，采用更健壮的解析方法。
+    从 HTML 内容中提取模型数据，适配2025年7月后的新版页面结构。
+    新结构将模型数据存储在 'initialModels' 键中。
     """
-    script_contents = re.findall(r'<script>(.*?)</script>', html_content, re.DOTALL)
     
-    for script_content in script_contents:
-        if 'self.__next_f.push' in script_content and 'initialState' in script_content and 'publicName' in script_content:
-            match = re.search(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', script_content, re.DOTALL)
-            if not match:
-                continue
+    # 辅助函数，用于在复杂的JSON对象中递归查找 'initialModels'
+    def find_initial_models_recursively(data):
+        if isinstance(data, dict):
+            # 优先直接查找当前字典层级
+            if 'initialModels' in data and isinstance(data['initialModels'], list):
+                model_list = data['initialModels']
+                # 基本验证，确保列表不为空且包含看起来像模型的数据
+                if model_list and isinstance(model_list[0], dict) and 'publicName' in model_list[0]:
+                    return model_list
             
-            full_payload = match.group(1)
-            
-            payload_string = full_payload.split('\\n')[0]
-            
-            json_start_index = payload_string.find(':')
-            if json_start_index == -1:
-                continue
-            
-            json_string_with_escapes = payload_string[json_start_index + 1:]
-            json_string = json_string_with_escapes.replace('\\"', '"')
-            
-            try:
-                data = json.loads(json_string)
-                
-                def find_initial_state(obj):
-                    if isinstance(obj, dict):
-                        for key, value in obj.items():
-                            if key == 'initialState' and isinstance(value, list):
-                                if value and isinstance(value[0], dict) and 'publicName' in value[0]:
-                                    return value
-                            result = find_initial_state(value)
-                            if result is not None:
-                                return result
-                    elif isinstance(obj, list):
-                        for item in obj:
-                            result = find_initial_state(item)
-                            if result is not None:
-                                return result
-                    return None
+            # 如果没找到，则递归到所有子值中
+            for value in data.values():
+                result = find_initial_models_recursively(value)
+                if result is not None:
+                    return result
 
-                models = find_initial_state(data)
-                if models:
-                    logger.info(f"成功从脚本块中提取到 {len(models)} 个模型。")
-                    return models
-            except json.JSONDecodeError as e:
-                logger.error(f"解析提取的JSON字符串时出错: {e}")
-                continue
+        elif isinstance(data, list):
+            # 递归到列表的每个元素中
+            for item in data:
+                result = find_initial_models_recursively(item)
+                if result is not None:
+                    return result
+        return None
 
-    logger.error("错误：在HTML响应中找不到包含有效模型数据的脚本块。")
-    return None
+    try:
+        # 使用更精确的正则表达式直接定位目标脚本块
+        script_match = re.search(r'<script>self\.__next_f\.push\(\[1,"(.*)"\]\)</script>', html_content, re.DOTALL)
+        if not script_match:
+            logger.error("解析错误：在HTML中找不到 'self.__next_f.push' 脚本块。")
+            return None
+
+        # 提取出的 payload 是一个被转义的 JSON 字符串
+        payload_with_escapes = script_match.group(1)
+        
+        # 移除转义符 \" 变为 "
+        payload_string = payload_with_escapes.replace('\\"', '"')
+        
+        # 找到第一个冒号，它分隔了前缀和真正的JSON数组
+        json_start_index = payload_string.find(':')
+        if json_start_index == -1:
+            logger.error("解析错误：在载荷中找不到 ':' 分隔符。")
+            return None
+        
+        # 提取真正的 JSON 内容进行解析
+        json_data_string = payload_string[json_start_index + 1:]
+        data = json.loads(json_data_string)
+        
+        # 使用新的递归函数来寻找模型列表
+        models = find_initial_models_recursively(data)
+        
+        if models:
+            logger.info(f"✅ 成功从 'initialModels' 键中提取到 {len(models)} 个模型。")
+            return models
+        else:
+            logger.error("❌ 解析错误：在JSON数据中找不到有效的 'initialModels' 列表。")
+            return None
+
+    except json.JSONDecodeError as e:
+        logger.error(f"解析提取的JSON字符串时出错: {e}, 内容(前100字符): {json_data_string[:100]}")
+        return None
+    except Exception as e:
+        logger.error(f"提取模型时发生未知错误: {e}", exc_info=True)
+        return None
 
 def compare_and_update_models(new_models_list, models_path):
     """
@@ -311,37 +328,65 @@ async def import_map(request: Request):
 @app.post("/update_models")
 async def update_models_endpoint(request: Request):
     """
-    接收来自油猴脚本的页面 HTML，提取并更新内存中的模型列表。
+    接收来自油猴脚本的页面 HTML，提取模型列表，并直接更新服务器内存中的模型映射。
+    此版本适配 Hugging Face 等无法写入文件的环境。
     """
-    global MODEL_NAME_TO_ID_MAP
-    html_content = await request.body()
-    if not html_content:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "No HTML content received."})
+    html_content_bytes = await request.body()
+    if not html_content_bytes:
+        logger.warning("模型更新请求未收到任何 HTML 内容。")
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "No HTML content received."}
+        )
     
     logger.info("收到页面内容，开始更新内存中的模型列表...")
-    new_models_list = extract_models_from_html(html_content.decode('utf-8'))
     
-    if new_models_list:
-        new_map = {model['publicName']: model.get('id') for model in new_models_list if 'publicName' in model and 'id' in model}
-        
-        # 与内存中的旧 map 对比，打印差异
-        old_keys = set(MODEL_NAME_TO_ID_MAP.keys())
-        new_keys = set(new_map.keys())
-        added = new_keys - old_keys
-        removed = old_keys - new_keys
-        
-        if added: logger.info(f"[模型更新] 新增模型: {', '.join(added)}")
-        if removed: logger.info(f"[模型更新] 删除模型: {', '.join(removed)}")
-        if not added and not removed: logger.info("[模型更新] 模型列表无变化。")
-            
-        # 直接更新全局变量
-        MODEL_NAME_TO_ID_MAP = new_map
-        logger.info(f"内存中的模型列表已更新，现有 {len(MODEL_NAME_TO_ID_MAP)} 个模型。")
-        return JSONResponse({"status": "success", "message": f"In-memory model map updated with {len(new_map)} models."})
-    else:
-        logger.error("未能从 HTML 中提取模型数据。")
-        return JSONResponse(status_code=400, content={"status": "error", "message": "Could not extract model data from HTML."})
+    try:
+        html_content = html_content_bytes.decode('utf-8')
+        # 调用我们刚刚更新的提取函数
+        new_models_list = extract_models_from_html(html_content)
+    except Exception as e:
+        logger.error(f"解析 HTML 或提取模型时发生异常: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": "Failed during HTML parsing or model extraction."}
+        )
 
+    if new_models_list:
+        global MODEL_NAME_TO_ID_MAP
+        
+        # 将提取到的模型列表转换为 {'name': 'id'} 的格式并更新到全局变量
+        new_model_map = {
+            model['publicName']: model.get('id') 
+            for model in new_models_list 
+            if 'publicName' in model and 'id' in model
+        }
+        
+        old_keys = set(MODEL_NAME_TO_ID_MAP.keys())
+        new_keys = set(new_model_map.keys())
+        
+        MODEL_NAME_TO_ID_MAP = new_model_map
+        
+        added = len(new_keys - old_keys)
+        removed = len(old_keys - new_keys)
+
+        logger.info("✅ 成功在内存中更新了模型列表。")
+        logger.info(f"   - 总模型数: {len(MODEL_NAME_TO_ID_MAP)}")
+        logger.info(f"   - 新增: {added}, 删除: {removed}")
+
+        return JSONResponse({
+            "status": "success", 
+            "message": "Model list updated in server memory.",
+            "total_models": len(MODEL_NAME_TO_ID_MAP)
+        })
+    else:
+        # 这个错误由 extract_models_from_html 内部打印，这里只返回响应
+        logger.error("未能从 HTML 中成功提取模型数据。")
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "Could not extract model data from HTML."}
+        )
+        
 # --- WebSocket 端点 (整合了所有稳定版逻辑) ---
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
