@@ -311,28 +311,36 @@ async def import_map(request: Request):
 @app.post("/update_models")
 async def update_models_endpoint(request: Request):
     """
-    接收来自油猴脚本的页面 HTML，提取并更新模型列表。
+    接收来自油猴脚本的页面 HTML，提取并更新内存中的模型列表。
     """
+    global MODEL_NAME_TO_ID_MAP
     html_content = await request.body()
     if not html_content:
-        logger.warning("模型更新请求未收到任何 HTML 内容。")
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": "No HTML content received."}
-        )
+        return JSONResponse(status_code=400, content={"status": "error", "message": "No HTML content received."})
     
-    logger.info("收到来自油猴脚本的页面内容，开始检查并更新模型...")
+    logger.info("收到页面内容，开始更新内存中的模型列表...")
     new_models_list = extract_models_from_html(html_content.decode('utf-8'))
     
     if new_models_list:
-        compare_and_update_models(new_models_list, 'models.json')
-        return JSONResponse({"status": "success", "message": "Model comparison and update complete."})
+        new_map = {model['publicName']: model.get('id') for model in new_models_list if 'publicName' in model and 'id' in model}
+        
+        # 与内存中的旧 map 对比，打印差异
+        old_keys = set(MODEL_NAME_TO_ID_MAP.keys())
+        new_keys = set(new_map.keys())
+        added = new_keys - old_keys
+        removed = old_keys - new_keys
+        
+        if added: logger.info(f"[模型更新] 新增模型: {', '.join(added)}")
+        if removed: logger.info(f"[模型更新] 删除模型: {', '.join(removed)}")
+        if not added and not removed: logger.info("[模型更新] 模型列表无变化。")
+            
+        # 直接更新全局变量
+        MODEL_NAME_TO_ID_MAP = new_map
+        logger.info(f"内存中的模型列表已更新，现有 {len(MODEL_NAME_TO_ID_MAP)} 个模型。")
+        return JSONResponse({"status": "success", "message": f"In-memory model map updated with {len(new_map)} models."})
     else:
-        logger.error("未能从油猴脚本提供的 HTML 中提取模型数据。")
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": "Could not extract model data from HTML."}
-        )
+        logger.error("未能从 HTML 中提取模型数据。")
+        return JSONResponse(status_code=400, content={"status": "error", "message": "Could not extract model data from HTML."})
 
 # --- WebSocket 端点 (整合了所有稳定版逻辑) ---
 @app.websocket("/ws")
@@ -644,6 +652,43 @@ async def delete_endpoint(payload: DeletePayload, username: str = Depends(get_cu
     logger.warning(f"删除失败：未找到模型 '{model_name}' 或对应的 Session ID。")
     raise HTTPException(status_code=404, detail="Endpoint not found")
 
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    """提供一个简单的HTML状态页面"""
+    ws_status = "✅ 已连接" if browser_ws and browser_ws.client_state.name == 'CONNECTED' else "❌ 未连接"
+    
+    # 计算已映射的模型数量和总ID数量
+    mapped_models_count = len(MODEL_ENDPOINT_MAP)
+    total_ids_count = 0
+    for model, endpoints in MODEL_ENDPOINT_MAP.items():
+        if isinstance(endpoints, list):
+            total_ids_count += len(endpoints)
+        elif isinstance(endpoints, dict):
+            total_ids_count += 1
+            
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="zh">
+    <head>
+        <meta charset="UTF-8"><title>LMArena Bridge Status</title>
+        <style>
+            body {{ display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #121212; color: #e0e0e0; font-family: sans-serif; }}
+            .status-box {{ background-color: #1e1e1e; border: 1px solid #383838; border-radius: 10px; padding: 2em 3em; text-align: center; box-shadow: 0 4px 15px rgba(0,0,0,0.2); }}
+            h1 {{ color: #76a9fa; margin-bottom: 1.5em; }}
+            p {{ font-size: 1.2em; line-height: 1.8; }}
+        </style>
+    </head>
+    <body>
+        <div class="status-box">
+            <h1>LMArena Bridge Status</h1>
+            <p><strong>油猴脚本连接状态:</strong> {ws_status}</p>
+            <p><strong>已映射模型种类数:</strong> {mapped_models_count}</p>
+            <p><strong>已捕获ID总数:</strong> {total_ids_count}</p>
+        </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
 
 @app.get("/admin", response_class=HTMLResponse)
 async def get_admin_page(username: str = Depends(get_current_user)):
