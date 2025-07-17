@@ -258,23 +258,41 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 # --- 云端适配API端点 ---
 @app.post("/v1/add-or-update-endpoint")
 async def add_or_update_endpoint(payload: EndpointUpdatePayload):
+    """接收并添加端点，增加了智能去重功能"""
     global MODEL_ENDPOINT_MAP
     new_entry = payload.dict(exclude_none=True, by_alias=True)
-    
-    # 核心逻辑：在内存中更新ID池
     model_name = new_entry.pop("modelName")
     
-    if model_name in MODEL_ENDPOINT_MAP and isinstance(MODEL_ENDPOINT_MAP[model_name], list):
-        MODEL_ENDPOINT_MAP[model_name].append(new_entry)
-        logger.info(f"成功为模型 '{model_name}' 追加了一个新的端点映射。")
-    else:
+    # 【【【 核心修改：智能去重逻辑 】】】
+    
+    # 1. 如果是为新模型添加第一个ID，直接创建列表
+    if model_name not in MODEL_ENDPOINT_MAP:
         MODEL_ENDPOINT_MAP[model_name] = [new_entry]
-        logger.info(f"成功为模型 '{model_name}' 创建了新的端点映射列表。")
-    
-    # 注意：写入文件的代码块已被移除，以避免权限错误
-    
-    return {"status": "success", "message": f"Endpoint for {model_name} updated."}
-    
+        logger.info(f"成功为新模型 '{model_name}' 创建了新的端点映射列表。")
+        return {"status": "success", "message": f"Endpoint for {model_name} created."}
+
+    # 2. 如果是为已存在的模型添加ID
+    if isinstance(MODEL_ENDPOINT_MAP.get(model_name), list):
+        endpoints = MODEL_ENDPOINT_MAP[model_name]
+        new_session_id = new_entry.get('sessionId')
+
+        # 检查这个 Session ID 是否已经存在于该模型的列表中
+        is_duplicate = any(ep.get('sessionId') == new_session_id for ep in endpoints)
+        
+        if not is_duplicate:
+            # 如果不是重复ID，则追加到列表
+            endpoints.append(new_entry)
+            logger.info(f"成功为模型 '{model_name}' 追加了一个新的端点映射。")
+            return {"status": "success", "message": f"New endpoint for {model_name} appended."}
+        else:
+            # 如果是重复ID，则忽略并打印日志
+            logger.info(f"检测到重复的 Session ID，已为模型 '{model_name}' 忽略本次添加。")
+            return {"status": "skipped", "message": "Duplicate endpoint ignored."}
+            
+    # 如果数据结构有问题（不是列表），记录错误
+    logger.error(f"为模型 '{model_name}' 添加端点时发生错误：数据结构不是预期的列表。")
+    raise HTTPException(status_code=500, detail="Internal data structure error.")
+
 @app.post("/v1/import-map")
 async def import_map(request: Request):
     global MODEL_ENDPOINT_MAP
