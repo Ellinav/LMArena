@@ -322,66 +322,58 @@ async def import_map(request: Request):
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
 
+# (在 api_server.py 中找到旧的 update_models_endpoint 函数并用下面的“调试版”代码完全替换它)
+
 @app.post("/update_models")
 async def update_models_endpoint(request: Request):
     """
-    接收来自油猴脚本的页面 HTML，提取模型列表，并直接更新服务器内存中的模型映射。
-    此版本适配 Hugging Face 等无法写入文件的环境。
+    【调试专用版】
+    接收来自油猴脚本的页面 HTML，如果解析失败，则将接收到的HTML内容片段打印到日志中，
+    以便我们分析为什么关键数据找不到。
     """
     html_content_bytes = await request.body()
-    if not html_content_bytes:
-        logger.warning("模型更新请求未收到任何 HTML 内容。")
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": "No HTML content received."}
-        )
-    
-    logger.info("收到页面内容，开始更新内存中的模型列表...")
-    
+    html_content = ""
     try:
+        if not html_content_bytes:
+            logger.warning("模型更新请求未收到任何 HTML 内容。")
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "No HTML content received."}
+            )
+        
         html_content = html_content_bytes.decode('utf-8')
-        # 调用我们刚刚更新的提取函数
+        logger.info("收到页面内容，开始更新内存中的模型列表...")
         new_models_list = extract_models_from_html(html_content)
+
+        if new_models_list:
+            # (如果成功，这里的逻辑和之前一样)
+            global MODEL_NAME_TO_ID_MAP
+            new_model_map = {
+                model['publicName']: model.get('id') 
+                for model in new_models_list 
+                if 'publicName' in model and 'id' in model
+            }
+            MODEL_NAME_TO_ID_MAP = new_model_map
+            logger.info(f"✅ [调试版] 成功在内存中更新了模型列表，共 {len(MODEL_NAME_TO_ID_MAP)} 个模型。")
+            return JSONResponse({"status": "success", "message": "Model list updated."})
+        else:
+            # 这是关键：如果解析失败，会走到这里
+            logger.error("未能从 HTML 中成功提取模型数据。")
+            raise ValueError("Extraction failed, entering debug log.")
+
     except Exception as e:
-        logger.error(f"解析 HTML 或提取模型时发生异常: {e}", exc_info=True)
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": "Failed during HTML parsing or model extraction."}
-        )
-
-    if new_models_list:
-        global MODEL_NAME_TO_ID_MAP
+        # 【【【 调试日志打印 】】】
+        # 无论因为什么原因失败，我们都在这里打印收到的HTML内容
+        logger.error(f"捕获到异常 '{e}'，现在打印接收到的HTML内容以供调试。")
+        logger.info("="*20 + " DEBUG HTML START " + "="*20)
+        # 我们只打印前 8000 个字符，避免日志过长，但通常足够分析了
+        logger.info(html_content[:8000])
+        logger.info("="*20 + "  DEBUG HTML END  " + "="*20)
         
-        # 将提取到的模型列表转换为 {'name': 'id'} 的格式并更新到全局变量
-        new_model_map = {
-            model['publicName']: model.get('id') 
-            for model in new_models_list 
-            if 'publicName' in model and 'id' in model
-        }
-        
-        old_keys = set(MODEL_NAME_TO_ID_MAP.keys())
-        new_keys = set(new_model_map.keys())
-        
-        MODEL_NAME_TO_ID_MAP = new_model_map
-        
-        added = len(new_keys - old_keys)
-        removed = len(old_keys - new_keys)
-
-        logger.info("✅ 成功在内存中更新了模型列表。")
-        logger.info(f"   - 总模型数: {len(MODEL_NAME_TO_ID_MAP)}")
-        logger.info(f"   - 新增: {added}, 删除: {removed}")
-
-        return JSONResponse({
-            "status": "success", 
-            "message": "Model list updated in server memory.",
-            "total_models": len(MODEL_NAME_TO_ID_MAP)
-        })
-    else:
-        # 这个错误由 extract_models_from_html 内部打印，这里只返回响应
-        logger.error("未能从 HTML 中成功提取模型数据。")
+        # 仍然像之前一样返回错误，以便浏览器端知道失败了
         return JSONResponse(
             status_code=400,
-            content={"status": "error", "message": "Could not extract model data from HTML."}
+            content={"status": "error", "message": "Could not extract model data from HTML. Debug info logged on server."}
         )
 
 # --- WebSocket 端点 (整合了所有稳定版逻辑) ---
