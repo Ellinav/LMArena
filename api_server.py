@@ -275,11 +275,31 @@ async def add_or_update_endpoint(payload: EndpointUpdatePayload):
     return {"status": "success", "message": f"Endpoint for {model_name} updated."}
       
 @app.get("/v1/export-map")
-async def export_map(request: Request):
-    api_key = os.environ.get("API_KEY") or CONFIG.get("api_key")
-    if api_key and request.headers.get('Authorization') != f"Bearer {api_key}":
+async def export_map(request: Request, api_key: Optional[str] = None):
+    """
+    导出模型端点映射。
+    增强版：支持通过 Bearer Token 或 URL查询参数 ?api_key=... 进行认证。
+    """
+    server_api_key = os.environ.get("API_KEY") or CONFIG.get("api_key")
+    
+    # 如果服务器设置了密钥，则必须进行验证
+    if server_api_key:
+        # 优先检查 Authorization 头部
+        auth_header = request.headers.get('Authorization')
+        if auth_header == f"Bearer {server_api_key}":
+            logger.info("正在通过 Bearer Token 授权导出模型端点映射...")
+            return JSONResponse(content=MODEL_ENDPOINT_MAP)
+        
+        # 如果头部验证失败，再检查URL查询参数
+        if api_key == server_api_key:
+            logger.info("正在通过 URL query_param 授权导出模型端点映射...")
+            return JSONResponse(content=MODEL_ENDPOINT_MAP)
+        
+        # 如果两种方式都失败，则拒绝访问
         raise HTTPException(status_code=401, detail="Invalid API Key")
-    logger.info("正在导出模型端点映射...")
+
+    # 如果服务器未设置密钥，则直接允许访问
+    logger.info("正在导出模型端点映射 (无需授权)...")
     return JSONResponse(content=MODEL_ENDPOINT_MAP)
 
 @app.post("/v1/import-map")
