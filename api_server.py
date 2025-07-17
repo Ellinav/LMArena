@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 import requests
 from packaging.version import parse as parse_version
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, Response, HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
