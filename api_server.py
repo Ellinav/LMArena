@@ -79,28 +79,23 @@ def load_model_map():
 # --- 模型更新 ---
 def extract_models_from_html(html_content):
     """
-    从 HTML 内容中提取模型数据，适配2025年7月后的新版页面结构。
-    新结构将模型数据存储在 'initialModels' 键中。
+    从 HTML 内容中提取模型数据（最终版）。
+    此版本能够处理 `self.__next_f.push` 载荷中的流式、多行JSON数据格式，
+    通过逐行扫描定位并解析包含 'initialModels' 的关键数据行。
     """
     
-    # 辅助函数，用于在复杂的JSON对象中递归查找 'initialModels'
+    # 辅助函数，用于在复杂的JSON对象中递归查找 'initialModels'。此函数本身是正确的。
     def find_initial_models_recursively(data):
         if isinstance(data, dict):
-            # 优先直接查找当前字典层级
             if 'initialModels' in data and isinstance(data['initialModels'], list):
                 model_list = data['initialModels']
-                # 基本验证，确保列表不为空且包含看起来像模型的数据
                 if model_list and isinstance(model_list[0], dict) and 'publicName' in model_list[0]:
                     return model_list
-            
-            # 如果没找到，则递归到所有子值中
             for value in data.values():
                 result = find_initial_models_recursively(value)
                 if result is not None:
                     return result
-
         elif isinstance(data, list):
-            # 递归到列表的每个元素中
             for item in data:
                 result = find_initial_models_recursively(item)
                 if result is not None:
@@ -108,41 +103,49 @@ def extract_models_from_html(html_content):
         return None
 
     try:
-        # 使用更精确的正则表达式直接定位目标脚本块
+        # 1. 定位到包含数据流的脚本块
         script_match = re.search(r'<script>self\.__next_f\.push\(\[1,"(.*)"\]\)</script>', html_content, re.DOTALL)
         if not script_match:
             logger.error("解析错误：在HTML中找不到 'self.__next_f.push' 脚本块。")
             return None
 
-        # 提取出的 payload 是一个被转义的 JSON 字符串
+        # 2. 提取出包含所有数据行的原始载荷字符串
         payload_with_escapes = script_match.group(1)
         
-        # 移除转义符 \" 变为 "
-        payload_string = payload_with_escapes.replace('\\"', '"')
-        
-        # 找到第一个冒号，它分隔了前缀和真正的JSON数组
-        json_start_index = payload_string.find(':')
-        if json_start_index == -1:
-            logger.error("解析错误：在载荷中找不到 ':' 分隔符。")
-            return None
-        
-        # 提取真正的 JSON 内容进行解析
-        json_data_string = payload_string[json_start_index + 1:]
-        data = json.loads(json_data_string)
-        
-        # 使用新的递归函数来寻找模型列表
-        models = find_initial_models_recursively(data)
-        
-        if models:
-            logger.info(f"✅ 成功从 'initialModels' 键中提取到 {len(models)} 个模型。")
-            return models
-        else:
-            logger.error("❌ 解析错误：在JSON数据中找不到有效的 'initialModels' 列表。")
-            return None
+        # 3. 将整个数据流按换行符 `\n` 分割成多行
+        # 注意：在原始字符串中，换行符被转义为 '\\n'
+        lines = payload_with_escapes.split('\\n')
 
-    except json.JSONDecodeError as e:
-        logger.error(f"解析提取的JSON字符串时出错: {e}, 内容(前100字符): {json_data_string[:100]}")
+        # 4. 逐行扫描，寻找包含模型数据的那一行
+        for line in lines:
+            # 目标行一定包含 "initialModels" 这个关键词
+            if '"initialModels"' in line:
+                try:
+                    # 该行的数据格式通常是 '5:[...]'，我们需要冒号后面的部分
+                    json_start_index = line.find(':')
+                    if json_start_index == -1:
+                        continue # 如果行格式不对，跳过
+
+                    # 提取可能包含JSON的字符串部分
+                    json_data_string = line[json_start_index + 1:]
+                    
+                    # 对这一行单独进行JSON反转义和解析
+                    json_data_string_unescaped = json_data_string.replace('\\"', '"')
+                    data = json.loads(json_data_string_unescaped)
+                    
+                    # 在解析成功的数据中寻找模型列表
+                    models = find_initial_models_recursively(data)
+                    if models:
+                        logger.info(f"✅ [最终版解析成功] 成功从 'initialModels' 数据行中提取到 {len(models)} 个模型。")
+                        return models
+                except Exception:
+                    # 如果解析某一行失败，不要终止整个过程，继续尝试下一行
+                    continue
+        
+        # 5. 如果遍历完所有行都没有找到，则报告失败
+        logger.error("❌ 解析失败：遍历所有数据行后，未能找到或解析包含 'initialModels' 的有效数据。")
         return None
+
     except Exception as e:
         logger.error(f"提取模型时发生未知错误: {e}", exc_info=True)
         return None
@@ -386,7 +389,7 @@ async def update_models_endpoint(request: Request):
             status_code=400,
             content={"status": "error", "message": "Could not extract model data from HTML."}
         )
-        
+
 # --- WebSocket 端点 (整合了所有稳定版逻辑) ---
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
