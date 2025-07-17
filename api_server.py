@@ -6,7 +6,8 @@ import requests
 from packaging.version import parse as parse_version
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, Response
+from fastapi.responses import StreamingResponse, JSONResponse, Response, HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
 from typing import Optional
 
@@ -273,35 +274,7 @@ async def add_or_update_endpoint(payload: EndpointUpdatePayload):
     # 注意：写入文件的代码块已被移除，以避免权限错误
     
     return {"status": "success", "message": f"Endpoint for {model_name} updated."}
-      
-@app.get("/v1/export-map")
-async def export_map(request: Request, api_key: Optional[str] = None):
-    """
-    导出模型端点映射。
-    增强版：支持通过 Bearer Token 或 URL查询参数 ?api_key=... 进行认证。
-    """
-    server_api_key = os.environ.get("API_KEY") or CONFIG.get("api_key")
     
-    # 如果服务器设置了密钥，则必须进行验证
-    if server_api_key:
-        # 优先检查 Authorization 头部
-        auth_header = request.headers.get('Authorization')
-        if auth_header == f"Bearer {server_api_key}":
-            logger.info("正在通过 Bearer Token 授权导出模型端点映射...")
-            return JSONResponse(content=MODEL_ENDPOINT_MAP)
-        
-        # 如果头部验证失败，再检查URL查询参数
-        if api_key == server_api_key:
-            logger.info("正在通过 URL query_param 授权导出模型端点映射...")
-            return JSONResponse(content=MODEL_ENDPOINT_MAP)
-        
-        # 如果两种方式都失败，则拒绝访问
-        raise HTTPException(status_code=401, detail="Invalid API Key")
-
-    # 如果服务器未设置密钥，则直接允许访问
-    logger.info("正在导出模型端点映射 (无需授权)...")
-    return JSONResponse(content=MODEL_ENDPOINT_MAP)
-
 @app.post("/v1/import-map")
 async def import_map(request: Request):
     global MODEL_ENDPOINT_MAP
@@ -596,6 +569,152 @@ async def start_id_capture():
     except Exception as e:
         logger.error(f"ID CAPTURE: 发送激活指令时出错: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to send command via WebSocket.")
+
+security = HTTPBasic()
+
+class DeletePayload(BaseModel):
+    model_name: str = Field(..., alias='modelName')
+    session_id: str = Field(..., alias='sessionId')
+
+def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
+    """处理浏览器弹出的密码窗口，验证API Key"""
+    server_api_key = os.environ.get("API_KEY") or CONFIG.get("api_key")
+    if server_api_key:
+        # credentials.password 就是用户在弹窗中输入的密码
+        if credentials.password == server_api_key:
+            return credentials.username
+    # 如果没有设置API Key，或者密码错误，则拒绝访问
+    # （对于未设置key的情况，为安全起见，此管理页面仍然需要一个象征性的密码）
+    raise HTTPException(
+        status_code=401,
+        detail="Incorrect API Key or credentials",
+        headers={"WWW-Authenticate": "Basic"},
+    )
+
+@app.post("/v1/delete-endpoint")
+async def delete_endpoint(payload: DeletePayload, username: str = Depends(get_current_user)):
+    """根据模型名和Session ID删除一个指定的端点"""
+    global MODEL_ENDPOINT_MAP
+    model_name = payload.model_name
+    session_id = payload.session_id
+
+    if model_name in MODEL_ENDPOINT_MAP and isinstance(MODEL_ENDPOINT_MAP[model_name], list):
+        endpoints = MODEL_ENDPOINT_MAP[model_name]
+        # 找到并移除匹配的端点
+        original_len = len(endpoints)
+        MODEL_ENDPOINT_MAP[model_name] = [ep for ep in endpoints if ep.get('sessionId') != session_id]
+        
+        if len(MODEL_ENDPOINT_MAP[model_name]) < original_len:
+            # 如果列表变空，则从字典中移除该模型
+            if not MODEL_ENDPOINT_MAP[model_name]:
+                del MODEL_ENDPOINT_MAP[model_name]
+            logger.info(f"成功从模型 '{model_name}' 中删除了 Session ID 为 ...{session_id[-6:]} 的端点。")
+            return {"status": "success", "message": "Endpoint deleted."}
+
+    logger.warning(f"删除失败：未找到模型 '{model_name}' 或对应的 Session ID。")
+    raise HTTPException(status_code=404, detail="Endpoint not found")
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def get_admin_page(username: str = Depends(get_current_user)):
+    """生成并返回一个美观的、带删除功能的HTML管理页面"""
+    
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="zh">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>LMArena Bridge - ID 管理后台</title>
+        <style>
+            body { font-family: sans-serif; background-color: #1a1a1a; color: #e0e0e0; margin: 0; padding: 2em; }
+            h1, h2 { color: #4a90e2; border-bottom: 2px solid #333; padding-bottom: 10px; }
+            .container { max-width: 1200px; margin: auto; }
+            .model-group { background-color: #2a2b32; border: 1px solid #444; border-radius: 8px; margin-bottom: 2em; padding: 1.5em; }
+            .endpoint-entry { background-color: #333; border: 1px solid #555; border-radius: 6px; padding: 1em; margin-top: 1em; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; }
+            .endpoint-details { font-family: 'Courier New', Courier, monospace; font-size: 0.9em; word-break: break-all; }
+            .delete-btn { background-color: #e2584a; color: white; border: none; padding: 8px 12px; border-radius: 4px; cursor: pointer; font-weight: bold; }
+            .delete-btn:hover { background-color: #c94f42; }
+            .no-ids { font-style: italic; color: #888; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>LMArena Bridge - ID 管理后台</h1>
+    """
+
+    if not MODEL_ENDPOINT_MAP:
+        html_content += "<p class='no-ids'>当前没有已捕获的ID。</p>"
+    else:
+        for model_name, endpoints in sorted(MODEL_ENDPOINT_MAP.items()):
+            html_content += f'<div class="model-group"><h2>{model_name}</h2>'
+            if not endpoints:
+                html_content += "<p class='no-ids'>此模型下没有端点。</p>"
+            else:
+                for ep in endpoints:
+                    session_id = ep.get('sessionId', 'N/A')
+                    message_id = ep.get('messageId', 'N/A')
+                    mode = ep.get('mode', 'N/A')
+                    battle_target = ep.get('battle_target', '')
+                    display_mode = f"{mode} ({battle_target})" if mode == 'battle' else mode
+
+                    html_content += f'''
+                    <div class="endpoint-entry" id="entry-{session_id}">
+                        <div class="endpoint-details">
+                            <strong>Session ID:</strong> {session_id}<br>
+                            <strong>Message ID:</strong> {message_id}<br>
+                            <strong>Mode:</strong> {display_mode}
+                        </div>
+                        <button class="delete-btn" data-model="{model_name}" data-session="{session_id}">删除</button>
+                    </div>
+                    '''
+            html_content += "</div>"
+
+    html_content += """
+        </div>
+        <script>
+            document.addEventListener('click', function(event) {
+                if (event.target.classList.contains('delete-btn')) {
+                    const button = event.target;
+                    const modelName = button.dataset.model;
+                    const sessionId = button.dataset.session;
+
+                    if (confirm(`确定要删除模型 '${modelName}' 下的这个 Session ID 吗？\\n${sessionId}`)) {
+                        fetch('/v1/delete-endpoint', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                // 浏览器会自动为同一站点的后续请求附加Basic Auth凭据
+                            },
+                            body: JSON.stringify({ modelName, sessionId })
+                        })
+                        .then(response => {
+                            if (!response.ok) {
+                                return response.json().then(err => { throw new Error(err.detail || '删除失败'); });
+                            }
+                            return response.json();
+                        })
+                        .then(data => {
+                            console.log('删除成功:', data);
+                            const entryElement = document.getElementById(`entry-${sessionId}`);
+                            if (entryElement) {
+                                entryElement.style.transition = 'opacity 0.5s';
+                                entryElement.style.opacity = '0';
+                                setTimeout(() => entryElement.remove(), 500);
+                            }
+                        })
+                        .catch(error => {
+                            console.error('删除时出错:', error);
+                            alert(`删除失败: ${error.message}`);
+                        });
+                    }
+                }
+            });
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
 
 if __name__ == "__main__":
     api_port = int(os.environ.get("PORT", 7860))
