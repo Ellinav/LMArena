@@ -79,9 +79,9 @@ def load_model_map():
 # --- 模型更新 ---
 def extract_models_from_html(html_content):
     """
-    从 HTML 内容中提取模型数据（最终版 V4）。
-    此版本使用高精度正则表达式，直接定位到包含 "initialModels" 关键字的
-    目标脚本块，然后再用流式解析方法处理，以确保准确性。
+    从 HTML 内容中提取模型数据（最终版 V5 - 稳健版）。
+    此版本放弃单一复杂正则，改为遍历所有脚本块，通过关键词筛选定位，
+    然后再对目标块进行解析，以应对潜在的HTML结构细微差异。
     """
     
     # 辅助函数，用于在复杂的JSON对象中递归查找 'initialModels'。此函数本身是正确的。
@@ -103,41 +103,46 @@ def extract_models_from_html(html_content):
         return None
 
     try:
-        # 1. 【核心修改】使用高精度正则表达式，它要求捕获的组内必须含有 "initialModels"
-        # 这可以确保我们从多个 self.__next_f.push 中选中唯一正确的那一个。
-        script_match = re.search(r'self\.__next_f\.push\(\[1,"(.*\"initialModels\".*)"\]\)', html_content, re.DOTALL)
+        # 1. "广撒网": 找到页面上所有的<script>标签内容
+        all_scripts_content = re.findall(r'<script>(.*?)</script>', html_content, re.DOTALL)
         
-        if not script_match:
-            logger.error("❌ [V4] 解析失败：在HTML中找不到任何包含 'initialModels' 的 'self.__next_f.push' 脚本块。")
+        target_script_content = None
+        # 2. "关键词筛选": 遍历所有脚本，找到我们唯一的目标
+        for script_content in all_scripts_content:
+            if 'self.__next_f.push' in script_content and 'initialModels' in script_content:
+                target_script_content = script_content
+                break  # 找到就停止
+
+        if not target_script_content:
+            logger.error("❌ [V5] 解析失败：遍历了所有<script>标签，但未找到同时包含 'self.__next_f.push' 和 'initialModels' 的目标脚本。")
             return None
 
-        # 2. 提取出包含所有数据行的原始载荷字符串
-        payload_with_escapes = script_match.group(1)
-        
-        # 3. 将整个数据流按换行符 `\n` 分割成多行
+        # 3. "精确解析": 只针对找到的正确脚本内容进行处理
+        payload_match = re.search(r'self\.__next_f\.push\(\[1,"(.*)"\]\)', target_script_content, re.DOTALL)
+        if not payload_match:
+            logger.error("❌ [V5] 找到了目标脚本块，但无法从中用正则提取载荷。")
+            return None
+
+        payload_with_escapes = payload_match.group(1)
         lines = payload_with_escapes.split('\\n')
 
-        # 4. 逐行扫描，寻找包含模型数据的那一行
         for line in lines:
             if '"initialModels"' in line:
                 try:
                     json_start_index = line.find(':')
-                    if json_start_index == -1:
-                        continue
-
-                    json_data_string = line[json_start_index + 1:]
-                    json_data_string_unescaped = json_data_string.replace('\\"', '"')
-                    data = json.loads(json_data_string_unescaped)
+                    if json_start_index == -1: continue
                     
+                    json_data_string = line[json_start_index + 1:].replace('\\"', '"')
+                    data = json.loads(json_data_string)
                     models = find_initial_models_recursively(data)
+                    
                     if models:
-                        logger.info(f"✅ [V4] 成功从 'initialModels' 数据行中提取到 {len(models)} 个模型。")
+                        logger.info(f"✅ [V5] 成功! 已从目标脚本中提取到 {len(models)} 个模型。")
                         return models
                 except Exception:
                     continue
         
-        # 5. 这段代码理论上不应该被执行，因为正则已经保证了 'initialModels' 的存在
-        logger.error("❌ [V4] 逻辑错误：找到了包含'initialModels'的脚本块，但在其中解析数据失败。")
+        logger.error("❌ [V5] 找到了目标脚本和载荷，但在载荷中解析 'initialModels' 数据时失败。")
         return None
 
     except Exception as e:
