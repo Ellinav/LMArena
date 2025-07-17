@@ -619,25 +619,36 @@ def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
 
 @app.post("/v1/delete-endpoint")
 async def delete_endpoint(payload: DeletePayload, username: str = Depends(get_current_user)):
-    """根据模型名和Session ID删除一个指定的端点"""
+    """根据模型名和Session ID删除一个指定的端点，并在列表为空时移除模型条目"""
     global MODEL_ENDPOINT_MAP
     model_name = payload.model_name
     session_id_to_delete = payload.session_id
 
     # 检查模型是否存在，并且其值是一个列表
-    if model_name in MODEL_ENDPOINT_MAP and isinstance(MODEL_ENDPOINT_MAP[model_name], list):
+    # (兼容旧数据，值也可能是单个字典)
+    if model_name in MODEL_ENDPOINT_MAP:
         endpoints = MODEL_ENDPOINT_MAP[model_name]
-        original_len = len(endpoints)
+        original_len = 0
+        
+        # 统一处理，确保我们操作的是列表
+        endpoint_list = []
+        if isinstance(endpoints, list):
+            endpoint_list = endpoints
+        elif isinstance(endpoints, dict):
+            endpoint_list = [endpoints]
 
-        # 【【【 核心修复逻辑 】】】
+        original_len = len(endpoint_list)
+
         # 新的过滤逻辑，能同时兼容 'sessionId' 和 'session_id' 两种键名
         filtered_endpoints = [
-            ep for ep in endpoints 
+            ep for ep in endpoint_list 
             if ep.get('sessionId', ep.get('session_id')) != session_id_to_delete
         ]
         
         # 如果列表长度变短，说明删除成功
         if len(filtered_endpoints) < original_len:
+            
+            # 【【【 核心修复逻辑 】】】
             # 如果删除后列表为空，则从字典中移除整个模型条目
             if not filtered_endpoints:
                 del MODEL_ENDPOINT_MAP[model_name]
@@ -651,7 +662,7 @@ async def delete_endpoint(payload: DeletePayload, username: str = Depends(get_cu
     # 如果上述条件都不满足，则说明未找到要删除的条目
     logger.warning(f"删除失败：未找到模型 '{model_name}' 或对应的 Session ID。")
     raise HTTPException(status_code=404, detail="Endpoint not found")
-
+    
 @app.get("/", response_class=HTMLResponse)
 async def root():
     """提供一个简单的HTML状态页面"""
