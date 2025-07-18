@@ -251,31 +251,16 @@ async def update_models_endpoint(request: Request):
     if not html_content_bytes:
         return JSONResponse(status_code=400, content={"status": "error", "message": "No HTML content received."})
     
-    logger.info("收到来自油猴脚本的页面内容，开始检查并更新模型...")
+    logger.info("收到来自油猴脚本的模型列表更新通知...")
     new_models_list = extract_models_from_html(html_content_bytes.decode('utf-8'))
     
     if new_models_list:
-        # 比较和更新的逻辑不变
-        await compare_and_update_models(new_models_list)
-    
-    # --- 【【【核心修改】】】 ---
-    # 无论是否有更新，都向刚连接的客户端推送一次最新的模型列表，以确保UI初始化
-    if browser_ws and browser_ws.client_state.name == 'CONNECTED':
-        try:
-            current_model_names = sorted(list(MODEL_NAME_TO_ID_MAP.keys()))
-            message_to_send = {
-                "command": "update_model_list",
-                "data": current_model_names
-            }
-            await browser_ws.send_text(json.dumps(message_to_send))
-            logger.info("✅ 已向客户端推送当前模型列表用于UI初始化。")
-        except Exception as e:
-            logger.warning(f"⚠️ 推送初始模型列表到客户端失败: {e}")
-            
-    return JSONResponse(
-        status_code=200, 
-        content={"status": "success", "message": "Model sync processed and current list pushed to client."}
-    )
+        # 只在后端默默地比较和更新，不再需要推送
+        # (compare_and_update_models 函数可以变回非 async 的普通 def 函数)
+        await compare_and_update_models(new_models_list) 
+        return JSONResponse(status_code=200, content={"status": "success", "message": "Server memory updated."})
+    else:
+        return JSONResponse(status_code=400, content={"status": "error", "message": "Could not extract model data from HTML."})
         
 @app.post("/v1/add-or-update-endpoint")
 async def add_or_update_endpoint(payload: EndpointUpdatePayload):
