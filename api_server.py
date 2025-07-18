@@ -1,15 +1,13 @@
-import asyncio, json, logging, os, sys, subprocess, time, uuid, re, threading, random, mimetypes
+import asyncio, json, logging, os, sys, re, threading, random
 from datetime import datetime
 from contextlib import asynccontextmanager
 import uvicorn
-import requests
-from packaging.version import parse as parse_version
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, Response, HTMLResponse
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 
 # --- 导入自定义模块 ---
 from modules import image_generation
@@ -45,11 +43,7 @@ def load_model_endpoint_map():
             if not content.strip(): MODEL_ENDPOINT_MAP = {}
             else: MODEL_ENDPOINT_MAP = json.loads(content)
         logger.info(f"成功从 'model_endpoint_map.json' 加载了 {len(MODEL_ENDPOINT_MAP)} 个模型端点映射。")
-    except FileNotFoundError:
-        logger.warning("'model_endpoint_map.json' 文件未找到。将使用空映射。")
-        MODEL_ENDPOINT_MAP = {}
-    except json.JSONDecodeError as e:
-        logger.error(f"加载或解析 'model_endpoint_map.json' 失败: {e}。将使用空映射。")
+    except (FileNotFoundError, json.JSONDecodeError):
         MODEL_ENDPOINT_MAP = {}
 
 def load_config():
@@ -59,11 +53,7 @@ def load_config():
             content = f.read()
             json_content = re.sub(r'//.*|/\*[\s\S]*?\*/', '', content)
             CONFIG = json.loads(json_content)
-        logger.info("成功从 'config.jsonc' 加载配置。")
-        logger.info(f"  - 酒馆模式 (Tavern Mode): {'✅ 启用' if CONFIG.get('tavern_mode_enabled') else '❌ 禁用'}")
-        logger.info(f"  - 绕过模式 (Bypass Mode): {'✅ 启用' if CONFIG.get('bypass_enabled') else '❌ 禁用'}")
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        logger.error(f"加载或解析 'config.jsonc' 失败: {e}。将使用默认配置。")
+    except (FileNotFoundError, json.JSONDecodeError):
         CONFIG = {}
 
 def load_model_map():
@@ -72,122 +62,41 @@ def load_model_map():
         with open('models.json', 'r', encoding='utf-8') as f:
             MODEL_NAME_TO_ID_MAP = json.load(f)
         logger.info(f"成功从 'models.json' 加载了 {len(MODEL_NAME_TO_ID_MAP)} 个模型。")
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        logger.error(f"加载 'models.json' 失败: {e}。将使用空模型列表。")
+    except (FileNotFoundError, json.JSONDecodeError):
         MODEL_NAME_TO_ID_MAP = {}
 
-# --- 模型更新 ---
-def extract_models_from_html(html_content):
+def compare_and_update_models(new_model_names: List[str], models_path: str):
     """
-    从 HTML 内容中提取模型数据，采用更健壮的解析方法。
-    """
-    script_contents = re.findall(r'<script>(.*?)</script>', html_content, re.DOTALL)
-    
-    for script_content in script_contents:
-        if 'self.__next_f.push' in script_content and 'initialState' in script_content and 'publicName' in script_content:
-            # 正则表达式保持不变，它能正确捕获整个数据块
-            match = re.search(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', script_content, re.DOTALL)
-            if not match:
-                continue
-            
-            full_payload = match.group(1)
-            
-            # 【【【 核心修复 v2 】】】
-            # LMArena可能在模型数据字符串中加入了换行符 (\n)。
-            # 旧的 .split('\\n')[0] 会导致数据被截断。
-            # 新的方法是直接移除所有 \n，将数据重新拼接成一行进行处理。
-            payload_string = full_payload.replace('\\n', '')
-            
-            json_start_index = payload_string.find(':')
-            if json_start_index == -1:
-                continue
-            
-            # 后续逻辑保持不变，因为它们是基于单行数据设计的
-            json_string_with_escapes = payload_string[json_start_index + 1:]
-            json_string = json_string_with_escapes.replace('\\"', '"')
-            
-            try:
-                data = json.loads(json_string)
-                
-                # 递归查找模型的函数保持不变
-                def find_initial_state(obj):
-                    if isinstance(obj, dict):
-                        for key, value in obj.items():
-                            if key == 'initialState' and isinstance(value, list):
-                                if value and isinstance(value[0], dict) and 'publicName' in value[0]:
-                                    return value
-                            result = find_initial_state(value)
-                            if result is not None:
-                                return result
-                    elif isinstance(obj, list):
-                        for item in obj:
-                            result = find_initial_state(item)
-                            if result is not None:
-                                return result
-                    return None
-
-                models = find_initial_state(data)
-                if models:
-                    logger.info(f"成功从脚本块中提取到 {len(models)} 个模型。")
-                    return models
-            except json.JSONDecodeError as e:
-                # 这里的日志现在对于调试至关重要
-                logger.error(f"解析提取的JSON字符串时出错: {e}")
-                continue
-
-    logger.error("错误：在HTML响应中找不到包含有效模型数据的脚本块。")
-    return None
-
-def compare_and_update_models(new_models_list, models_path):
-    """
-    比较新旧模型列表，打印详细差异，并用新列表更新本地 models.json 文件。
+    接收一个模型名称列表，与现有 models.json 比对，并更新文件。
+    新的 models.json 将采用 { "model_name": "model_name" } 的格式。
     """
     try:
-        # 确保即使文件不存在或为空也能正常工作
         if os.path.exists(models_path) and os.path.getsize(models_path) > 0:
             with open(models_path, 'r', encoding='utf-8') as f:
-                old_models = json.load(f)
+                old_models_map = json.load(f)
         else:
-            old_models = {}
+            old_models_map = {}
     except (FileNotFoundError, json.JSONDecodeError):
-        old_models = {}
+        old_models_map = {}
 
-    # 从新列表中构建 名称 -> ID 的字典
-    new_models_dict = {model['publicName']: model.get('id') for model in new_models_list if 'publicName' in model and 'id' in model}
-    
-    old_models_set = set(old_models.keys())
-    new_models_set = set(new_models_dict.keys())
+    old_model_names = set(old_models_map.keys())
+    new_model_names_set = set(new_model_names)
 
-    added_models = new_models_set - old_models_set
-    removed_models = old_models_set - new_models_set
-    
-    logger.info("---[ 模型列表更新检查 ]---")
-    has_changes = False
+    added_models = new_model_names_set - old_model_names
+    removed_models = old_model_names - new_model_names_set
+
+    logger.info("---[ 模型列表更新检查 (API模式) ]---")
+    has_changes = bool(added_models or removed_models)
 
     if added_models:
-        has_changes = True
         logger.info("\n[+] 新增模型:")
         for name in sorted(list(added_models)):
-            logger.info(f"  - {name} (ID: {new_models_dict.get(name)})")
+            logger.info(f"  - {name}")
 
     if removed_models:
-        has_changes = True
         logger.info("\n[-] 已移除模型:")
         for name in sorted(list(removed_models)):
-            logger.info(f"  - {name} (原ID: {old_models.get(name)})")
-
-    logger.info("\n[*] 存量模型ID检查:")
-    changed_id_models = 0
-    for name in sorted(list(new_models_set.intersection(old_models_set))):
-        new_id = new_models_dict.get(name)
-        old_id = old_models.get(name)
-        if new_id != old_id:
-            has_changes = True
-            changed_id_models += 1
-            logger.info(f"  - ID 变更: '{name}' | 旧ID: {old_id} -> 新ID: {new_id}")
-    
-    if changed_id_models == 0:
-        logger.info("  - 所有存量模型的ID均无变化。")
+            logger.info(f"  - {name}")
 
     if not has_changes:
         logger.info("\n[结论] 模型列表与本地版本一致，无需更新。")
@@ -195,15 +104,17 @@ def compare_and_update_models(new_models_list, models_path):
         return
 
     logger.info("\n[结论] 检测到模型列表变更，正在更新 'models.json'...")
+    # 构建新的 名称 -> 名称 映射
+    new_models_dict = {name: name for name in new_model_names}
+
     try:
         with open(models_path, 'w', encoding='utf-8') as f:
             json.dump(new_models_dict, f, indent=4, ensure_ascii=False, sort_keys=True)
         logger.info(f"✅ 'models.json' 已成功更新，当前包含 {len(new_models_dict)} 个模型。")
-        # 关键：更新后立即重新加载到内存
-        load_model_map()
+        load_model_map()  # 立即重新加载到内存
     except IOError as e:
         logger.error(f"❌ 写入 '{models_path}' 文件时出错: {e}")
-    
+
     logger.info("---[ 检查与更新完毕 ]---")
 
 def restart_server():
@@ -309,19 +220,23 @@ async def import_map(request: Request):
 
 @app.post("/update_models")
 async def update_models_endpoint(request: Request):
-    html_content = await request.body()
-    if not html_content:
-        logger.warning("模型更新请求未收到任何 HTML 内容。")
-        return JSONResponse(status_code=400, content={"status": "error", "message": "No HTML content received."})
-    logger.info("收到来自油猴脚本的页面内容，开始检查并更新模型...")
-    new_models_list = extract_models_from_html(html_content.decode('utf-8'))
-    if new_models_list:
-        # 使用我们修改过的增强版比较函数
-        compare_and_update_models(new_models_list, 'models.json')
-        return JSONResponse({"status": "success", "message": "Model comparison and update complete."})
-    else:
-        logger.error("未能从油猴脚本提供的 HTML 中提取模型数据。")
-        return JSONResponse(status_code=400, content={"status": "error", "message": "Could not extract model data from HTML."})
+    """
+    接收来自油猴脚本拦截到的模型名称列表 (JSON数组)，并进行比对和更新。
+    """
+    try:
+        model_name_list = await request.json()
+        if not isinstance(model_name_list, list):
+            raise ValueError("Expected a JSON array (list).")
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.error(f"模型更新请求的Body不是有效的JSON数组: {e}")
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": f"Invalid request body: {e}"}
+        )
+    
+    logger.info(f"收到来自油猴脚本的 {len(model_name_list)} 个模型名称，开始检查并更新...")
+    compare_and_update_models(model_name_list, 'models.json')
+    return JSONResponse({"status": "success", "message": "Model list received and processed."})
 
 # --- WebSocket 端点 (整合了所有稳定版逻辑) ---
 @app.websocket("/ws")
