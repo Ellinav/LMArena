@@ -1,16 +1,18 @@
-import asyncio, json, logging, os, sys, re, threading, random
+import asyncio, json, logging, os, sys, subprocess, time, uuid, re, threading, random, mimetypes
 from datetime import datetime
 from contextlib import asynccontextmanager
 import uvicorn
+import requests
+from packaging.version import parse as parse_version
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, JSONResponse, Response, HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
 from typing import Optional
 
-# --- 导入自定义模块 (如果您的项目有) ---
-# from modules import image_generation
+# --- 导入自定义模块 ---
+from modules import image_generation
 
 # --- 基础配置 ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,11 +24,12 @@ browser_ws: WebSocket | None = None
 response_channels: dict[str, asyncio.Queue] = {}
 last_activity_time = None
 idle_monitor_thread = None
+WARNED_UNKNOWN_IDS = set()
 main_event_loop = None
 MODEL_NAME_TO_ID_MAP = {}
 MODEL_ENDPOINT_MAP = {}
+DEFAULT_MODEL_ID = "f44e280a-7914-43ca-a25d-ecfcc5d48d09"
 
-# --- Pydantic 模型 ---
 class EndpointUpdatePayload(BaseModel):
     model_name: str = Field(..., alias='modelName')
     session_id: str = Field(..., alias='sessionId')
@@ -34,11 +37,21 @@ class EndpointUpdatePayload(BaseModel):
     mode: str
     battle_target: Optional[str] = Field(None, alias='battleTarget')
 
-class DeletePayload(BaseModel):
-    model_name: str = Field(..., alias='modelName')
-    session_id: str = Field(..., alias='sessionId')
+def load_model_endpoint_map():
+    global MODEL_ENDPOINT_MAP
+    try:
+        with open('model_endpoint_map.json', 'r', encoding='utf-8') as f:
+            content = f.read()
+            if not content.strip(): MODEL_ENDPOINT_MAP = {}
+            else: MODEL_ENDPOINT_MAP = json.loads(content)
+        logger.info(f"成功从 'model_endpoint_map.json' 加载了 {len(MODEL_ENDPOINT_MAP)} 个模型端点映射。")
+    except FileNotFoundError:
+        logger.warning("'model_endpoint_map.json' 文件未找到。将使用空映射。")
+        MODEL_ENDPOINT_MAP = {}
+    except json.JSONDecodeError as e:
+        logger.error(f"加载或解析 'model_endpoint_map.json' 失败: {e}。将使用空映射。")
+        MODEL_ENDPOINT_MAP = {}
 
-# --- 核心加载函数 ---
 def load_config():
     global CONFIG
     try:
@@ -47,8 +60,10 @@ def load_config():
             json_content = re.sub(r'//.*|/\*[\s\S]*?\*/', '', content)
             CONFIG = json.loads(json_content)
         logger.info("成功从 'config.jsonc' 加载配置。")
-    except Exception as e:
-        logger.error(f"加载 'config.jsonc' 失败: {e}。将使用空配置。")
+        logger.info(f"  - 酒馆模式 (Tavern Mode): {'✅ 启用' if CONFIG.get('tavern_mode_enabled') else '❌ 禁用'}")
+        logger.info(f"  - 绕过模式 (Bypass Mode): {'✅ 启用' if CONFIG.get('bypass_enabled') else '❌ 禁用'}")
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        logger.error(f"加载或解析 'config.jsonc' 失败: {e}。将使用默认配置。")
         CONFIG = {}
 
 def load_model_map():
@@ -56,37 +71,174 @@ def load_model_map():
     try:
         with open('models.json', 'r', encoding='utf-8') as f:
             MODEL_NAME_TO_ID_MAP = json.load(f)
-        logger.info(f"✅ [稳定版] 成功从 'models.json' 加载了 {len(MODEL_NAME_TO_ID_MAP)} 个模型。这是唯一的模型数据源。")
-    except Exception as e:
-        logger.error(f"加载 'models.json' 失败: {e}。模型列表将为空。请确保该文件存在且格式正确。")
+        logger.info(f"成功从 'models.json' 加载了 {len(MODEL_NAME_TO_ID_MAP)} 个模型。")
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        logger.error(f"加载 'models.json' 失败: {e}。将使用空模型列表。")
         MODEL_NAME_TO_ID_MAP = {}
 
-def load_model_endpoint_map():
-    global MODEL_ENDPOINT_MAP
-    try:
-        with open('model_endpoint_map.json', 'r', encoding='utf-8') as f:
-            content = f.read()
-            MODEL_ENDPOINT_MAP = json.loads(content) if content.strip() else {}
-        logger.info(f"成功从 'model_endpoint_map.json' 加载了 {len(MODEL_ENDPOINT_MAP)} 个模型端点映射。")
-    except Exception as e:
-        logger.warning(f"加载或解析 'model_endpoint_map.json' 失败: {e}。将使用空映射。")
-        MODEL_ENDPOINT_MAP = {}
+# --- 模型更新 ---
+def extract_models_from_html(html_content):
+    """
+    从 HTML 内容中提取模型数据，采用更健壮的解析方法。
+    """
+    script_contents = re.findall(r'<script>(.*?)</script>', html_content, re.DOTALL)
+    
+    for script_content in script_contents:
+        if 'self.__next_f.push' in script_content and 'initialState' in script_content and 'publicName' in script_content:
+            match = re.search(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', script_content, re.DOTALL)
+            if not match:
+                continue
+            
+            full_payload = match.group(1)
+            
+            payload_string = full_payload.split('\\n')[0]
+            
+            json_start_index = payload_string.find(':')
+            if json_start_index == -1:
+                continue
+            
+            json_string_with_escapes = payload_string[json_start_index + 1:]
+            json_string = json_string_with_escapes.replace('\\"', '"')
+            
+            try:
+                data = json.loads(json_string)
+                
+                def find_initial_state(obj):
+                    if isinstance(obj, dict):
+                        for key, value in obj.items():
+                            if key == 'initialState' and isinstance(value, list):
+                                if value and isinstance(value[0], dict) and 'publicName' in value[0]:
+                                    return value
+                            result = find_initial_state(value)
+                            if result is not None:
+                                return result
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            result = find_initial_state(item)
+                            if result is not None:
+                                return result
+                    return None
 
-# --- 心跳与闲置重启 ---
+                models = find_initial_state(data)
+                if models:
+                    logger.info(f"成功从脚本块中提取到 {len(models)} 个模型。")
+                    return models
+            except json.JSONDecodeError as e:
+                logger.error(f"解析提取的JSON字符串时出错: {e}")
+                continue
+
+    logger.error("错误：在HTML响应中找不到包含有效模型数据的脚本块。")
+    return None
+
+def compare_and_update_models(new_models_list, models_path):
+    """
+    比较新旧模型列表，打印详细差异，并用新列表更新本地 models.json 文件。
+    """
+    try:
+        # 确保即使文件不存在或为空也能正常工作
+        if os.path.exists(models_path) and os.path.getsize(models_path) > 0:
+            with open(models_path, 'r', encoding='utf-8') as f:
+                old_models = json.load(f)
+        else:
+            old_models = {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        old_models = {}
+
+    # 从新列表中构建 名称 -> ID 的字典
+    new_models_dict = {model['publicName']: model.get('id') for model in new_models_list if 'publicName' in model and 'id' in model}
+    
+    old_models_set = set(old_models.keys())
+    new_models_set = set(new_models_dict.keys())
+
+    added_models = new_models_set - old_models_set
+    removed_models = old_models_set - new_models_set
+    
+    logger.info("---[ 模型列表更新检查 ]---")
+    has_changes = False
+
+    if added_models:
+        has_changes = True
+        logger.info("\n[+] 新增模型:")
+        for name in sorted(list(added_models)):
+            logger.info(f"  - {name} (ID: {new_models_dict.get(name)})")
+
+    if removed_models:
+        has_changes = True
+        logger.info("\n[-] 已移除模型:")
+        for name in sorted(list(removed_models)):
+            logger.info(f"  - {name} (原ID: {old_models.get(name)})")
+
+    logger.info("\n[*] 存量模型ID检查:")
+    changed_id_models = 0
+    for name in sorted(list(new_models_set.intersection(old_models_set))):
+        new_id = new_models_dict.get(name)
+        old_id = old_models.get(name)
+        if new_id != old_id:
+            has_changes = True
+            changed_id_models += 1
+            logger.info(f"  - ID 变更: '{name}' | 旧ID: {old_id} -> 新ID: {new_id}")
+    
+    if changed_id_models == 0:
+        logger.info("  - 所有存量模型的ID均无变化。")
+
+    if not has_changes:
+        logger.info("\n[结论] 模型列表与本地版本一致，无需更新。")
+        logger.info("---[ 检查完毕 ]---")
+        return
+
+    logger.info("\n[结论] 检测到模型列表变更，正在更新 'models.json'...")
+    try:
+        with open(models_path, 'w', encoding='utf-8') as f:
+            json.dump(new_models_dict, f, indent=4, ensure_ascii=False, sort_keys=True)
+        logger.info(f"✅ 'models.json' 已成功更新，当前包含 {len(new_models_dict)} 个模型。")
+        # 关键：更新后立即重新加载到内存
+        load_model_map()
+    except IOError as e:
+        logger.error(f"❌ 写入 '{models_path}' 文件时出错: {e}")
+    
+    logger.info("---[ 检查与更新完毕 ]---")
+
+def restart_server():
+    logger.warning("="*60)
+    logger.warning("检测到服务器空闲超时，准备自动重启...")
+    async def notify_browser_refresh():
+        if browser_ws:
+            try:
+                await browser_ws.send_text(json.dumps({"command": "reconnect"}))
+                logger.info("已向浏览器发送 'reconnect' 指令。")
+            except Exception as e:
+                logger.error(f"发送 'reconnect' 指令失败: {e}")
+    if browser_ws and browser_ws.client_state.name == 'CONNECTED' and main_event_loop:
+        asyncio.run_coroutine_threadsafe(notify_browser_refresh(), main_event_loop)
+    time.sleep(3)
+    logger.info("正在重启服务器...")
+    os.execv(sys.executable, ['python'] + sys.argv)
+
+def idle_monitor():
+    global last_activity_time
+    while last_activity_time is None: time.sleep(1)
+    logger.info("空闲监控线程已启动。")
+    while True:
+        if CONFIG.get("enable_idle_restart", False):
+            timeout = CONFIG.get("idle_restart_timeout_seconds", 300)
+            if timeout == -1:
+                time.sleep(10)
+                continue
+            if (datetime.now() - last_activity_time).total_seconds() > timeout:
+                restart_server()
+                break
+        time.sleep(10)
+
 async def send_pings():
     while True:
         await asyncio.sleep(30)
         if browser_ws:
             try:
                 await browser_ws.send_text(json.dumps({"command": "ping"}))
+                logger.debug("Ping sent.")
             except Exception:
-                pass
+                logger.debug("Ping发送失败，连接可能已关闭。")
 
-def idle_monitor():
-    # 此处省略具体实现，与您提供的代码一致
-    pass
-
-# --- FastAPI 生命周期 ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global main_event_loop, last_activity_time, idle_monitor_thread
@@ -97,80 +249,38 @@ async def lifespan(app: FastAPI):
     logger.info("服务器启动完成。等待油猴脚本连接...")
     asyncio.create_task(send_pings())
     logger.info("已启动WebSocket心跳维持任务。")
-    # ... 其他您需要的启动逻辑 ...
+    last_activity_time = datetime.now()
+    if CONFIG.get("enable_idle_restart", False):
+        idle_monitor_thread = threading.Thread(target=idle_monitor, daemon=True)
+        idle_monitor_thread.start()
+    image_generation.initialize_image_module(logger, response_channels, CONFIG, MODEL_NAME_TO_ID_MAP, DEFAULT_MODEL_ID)
     yield
     logger.info("服务器正在关闭。")
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# --- WebSocket 端点 ---
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    global browser_ws
-    await websocket.accept()
-    if browser_ws:
-        logger.warning("检测到新的油猴脚本连接，旧的连接将被替换。")
-    
-    logger.info("✅ 油猴脚本已成功连接 WebSocket。")
-    try:
-        await websocket.send_text(json.dumps({"status": "connected"}))
-    except Exception: pass
-    
-    browser_ws = websocket
-    try:
-        while True:
-            message_str = await websocket.receive_text()
-            message = json.loads(message_str)
-            if message.get("status") == "pong": continue
-            request_id = message.get("request_id")
-            data = message.get("data")
-            if request_id and data is not None and request_id in response_channels:
-                await response_channels[request_id].put(data)
-    except WebSocketDisconnect:
-        logger.warning("❌ 油猴脚本客户端已断开连接。")
-    finally:
-        browser_ws = None
-        for queue in response_channels.values():
-            await queue.put({"error": "Browser disconnected"})
-        response_channels.clear()
-        logger.info("WebSocket 连接已清理。")
-
 # --- 云端适配API端点 ---
 @app.post("/v1/add-or-update-endpoint")
 async def add_or_update_endpoint(payload: EndpointUpdatePayload):
-    """接收并添加端点，增加了智能去重功能"""
     global MODEL_ENDPOINT_MAP
     new_entry = payload.dict(exclude_none=True, by_alias=True)
     model_name = new_entry.pop("modelName")
-    
-    # 【【【 核心修改：智能去重逻辑 】】】
-    
-    # 1. 如果是为新模型添加第一个ID，直接创建列表
     if model_name not in MODEL_ENDPOINT_MAP:
         MODEL_ENDPOINT_MAP[model_name] = [new_entry]
         logger.info(f"成功为新模型 '{model_name}' 创建了新的端点映射列表。")
         return {"status": "success", "message": f"Endpoint for {model_name} created."}
-
-    # 2. 如果是为已存在的模型添加ID
     if isinstance(MODEL_ENDPOINT_MAP.get(model_name), list):
         endpoints = MODEL_ENDPOINT_MAP[model_name]
         new_session_id = new_entry.get('sessionId')
-
-        # 检查这个 Session ID 是否已经存在于该模型的列表中
         is_duplicate = any(ep.get('sessionId') == new_session_id for ep in endpoints)
-        
         if not is_duplicate:
-            # 如果不是重复ID，则追加到列表
             endpoints.append(new_entry)
             logger.info(f"成功为模型 '{model_name}' 追加了一个新的端点映射。")
             return {"status": "success", "message": f"New endpoint for {model_name} appended."}
         else:
-            # 如果是重复ID，则忽略并打印日志
             logger.info(f"检测到重复的 Session ID，已为模型 '{model_name}' 忽略本次添加。")
             return {"status": "skipped", "message": "Duplicate endpoint ignored."}
-            
-    # 如果数据结构有问题（不是列表），记录错误
     logger.error(f"为模型 '{model_name}' 添加端点时发生错误：数据结构不是预期的列表。")
     raise HTTPException(status_code=500, detail="Internal data structure error.")
 
@@ -189,45 +299,63 @@ async def import_map(request: Request):
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
 
+@app.post("/update_models")
+async def update_models_endpoint(request: Request):
+    html_content = await request.body()
+    if not html_content:
+        logger.warning("模型更新请求未收到任何 HTML 内容。")
+        return JSONResponse(status_code=400, content={"status": "error", "message": "No HTML content received."})
+    logger.info("收到来自油猴脚本的页面内容，开始检查并更新模型...")
+    new_models_list = extract_models_from_html(html_content.decode('utf-8'))
+    if new_models_list:
+        # 使用我们修改过的增强版比较函数
+        compare_and_update_models(new_models_list, 'models.json')
+        return JSONResponse({"status": "success", "message": "Model comparison and update complete."})
+    else:
+        logger.error("未能从油猴脚本提供的 HTML 中提取模型数据。")
+        return JSONResponse(status_code=400, content={"status": "error", "message": "Could not extract model data from HTML."})
+
 # --- WebSocket 端点 (整合了所有稳定版逻辑) ---
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    global browser_ws
+    global browser_ws, WARNED_UNKNOWN_IDS
     await websocket.accept()
-    if browser_ws:
-        logger.warning("检测到新的油猴脚本连接，旧的连接将被替换。")
-    
+    if browser_ws: logger.warning("检测到新的油猴脚本连接，旧的连接将被替换。")
+    WARNED_UNKNOWN_IDS.clear()
     logger.info("✅ 油猴脚本已成功连接 WebSocket。")
     try:
         await websocket.send_text(json.dumps({"status": "connected"}))
-    except Exception: pass
-    
+    except Exception as e:
+        logger.error(f"发送 'connected' 状态失败: {e}")
     browser_ws = websocket
     try:
         while True:
             message_str = await websocket.receive_text()
             message = json.loads(message_str)
-
-            # 处理心跳响应
             if message.get("status") == "pong":
+                logger.debug("Pong received from client.")
                 continue
-
-            # 处理服务器指令
-            if message.get("command") in ["reconnect", "refresh"]:
-                continue
-
-            # 处理聊天/图像生成请求
             request_id = message.get("request_id")
             data = message.get("data")
-            if request_id and data is not None and request_id in response_channels:
+            if not request_id or data is None:
+                logger.warning(f"收到来自浏览器的无效消息: {message}")
+                continue
+            if request_id in response_channels:
                 await response_channels[request_id].put(data)
-
+            else:
+                if request_id not in WARNED_UNKNOWN_IDS:
+                    logger.warning(f"⚠️ 收到未知或已关闭请求的响应: {request_id}。")
+                    WARNED_UNKNOWN_IDS.add(request_id)
     except WebSocketDisconnect:
         logger.warning("❌ 油猴脚本客户端已断开连接。")
+        if response_channels:
+            logger.warning(f"WebSocket 连接断开！正在清理 {len(response_channels)} 个待处理的请求通道...")
+    except Exception as e:
+        logger.error(f"WebSocket 处理时发生未知错误: {e}", exc_info=True)
     finally:
         browser_ws = None
         for queue in response_channels.values():
-            await queue.put({"error": "Browser disconnected"})
+            await queue.put({"error": "Browser disconnected during operation"})
         response_channels.clear()
         logger.info("WebSocket 连接已清理。")
 
@@ -464,36 +592,25 @@ def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
 
 @app.post("/v1/delete-endpoint")
 async def delete_endpoint(payload: DeletePayload, username: str = Depends(get_current_user)):
-    """根据模型名和Session ID删除一个指定的端点，并在列表为空时移除模型条目"""
+    """根据模型名和Session ID删除一个指定的端点"""
     global MODEL_ENDPOINT_MAP
     model_name = payload.model_name
     session_id_to_delete = payload.session_id
 
     # 检查模型是否存在，并且其值是一个列表
-    # (兼容旧数据，值也可能是单个字典)
-    if model_name in MODEL_ENDPOINT_MAP:
+    if model_name in MODEL_ENDPOINT_MAP and isinstance(MODEL_ENDPOINT_MAP[model_name], list):
         endpoints = MODEL_ENDPOINT_MAP[model_name]
-        original_len = 0
-        
-        # 统一处理，确保我们操作的是列表
-        endpoint_list = []
-        if isinstance(endpoints, list):
-            endpoint_list = endpoints
-        elif isinstance(endpoints, dict):
-            endpoint_list = [endpoints]
+        original_len = len(endpoints)
 
-        original_len = len(endpoint_list)
-
+        # 【【【 核心修复逻辑 】】】
         # 新的过滤逻辑，能同时兼容 'sessionId' 和 'session_id' 两种键名
         filtered_endpoints = [
-            ep for ep in endpoint_list 
+            ep for ep in endpoints 
             if ep.get('sessionId', ep.get('session_id')) != session_id_to_delete
         ]
         
         # 如果列表长度变短，说明删除成功
         if len(filtered_endpoints) < original_len:
-            
-            # 【【【 核心修复逻辑 】】】
             # 如果删除后列表为空，则从字典中移除整个模型条目
             if not filtered_endpoints:
                 del MODEL_ENDPOINT_MAP[model_name]
@@ -507,7 +624,7 @@ async def delete_endpoint(payload: DeletePayload, username: str = Depends(get_cu
     # 如果上述条件都不满足，则说明未找到要删除的条目
     logger.warning(f"删除失败：未找到模型 '{model_name}' 或对应的 Session ID。")
     raise HTTPException(status_code=404, detail="Endpoint not found")
-    
+
 @app.get("/", response_class=HTMLResponse)
 async def root():
     """提供一个简单的HTML状态页面"""
@@ -561,7 +678,7 @@ async def get_admin_page(username: str = Depends(get_current_user)):
             body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 2em; }
             h1, h2 { color: #76a9fa; border-bottom: 1px solid #333; padding-bottom: 10px; }
             .container { max-width: 1200px; margin: auto; }
-            .model-group { background-color: #1e1e1e; border: 1px solid #383838; border-radius: 8px; margin-bottom: 2em; padding: 1em 1.5em; transition: opacity 0.5s, transform 0.5s; }
+            .model-group { background-color: #1e1e1e; border: 1px solid #383838; border-radius: 8px; margin-bottom: 2em; padding: 1em 1.5em; }
             .endpoint-entry { background-color: #2a2b32; border-left: 3px solid #4a90e2; padding: 1em; margin-top: 1em; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1em; }
             .endpoint-details { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; font-size: 0.9em; word-break: break-all; line-height: 1.6; }
             .delete-btn { background-color: #da3633; color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: background-color 0.2s; }
@@ -578,23 +695,29 @@ async def get_admin_page(username: str = Depends(get_current_user)):
         html_content += "<p class='no-ids'>当前没有已捕获的ID。</p>"
     else:
         for model_name, endpoints in sorted(MODEL_ENDPOINT_MAP.items()):
-            html_content += f'<div class="model-group" data-model-group="{model_name}">'
-            html_content += f'<h2>{model_name}</h2>'
+            html_content += f'<div class="model-group"><h2>{model_name}</h2>'
             
+            # 【【【 核心修复逻辑 】】】
+            # 检查endpoints是列表还是单个字典，并统一处理为列表
             endpoint_list = []
-            if isinstance(endpoints, list): endpoint_list = endpoints
-            elif isinstance(endpoints, dict): endpoint_list = [endpoints]
+            if isinstance(endpoints, list):
+                endpoint_list = endpoints
+            elif isinstance(endpoints, dict):
+                endpoint_list = [endpoints] # 将单个字典放入列表中
 
             if not endpoint_list:
                 html_content += "<p class='no-ids'>此模型下没有端点。</p>"
             else:
                 for ep in endpoint_list:
+                    # 确保 ep 是字典，如果不是则跳过，防止意外错误
                     if not isinstance(ep, dict): continue
-                    session_id = ep.get('sessionId', ep.get('session_id', 'N/A'))
+
+                    session_id = ep.get('sessionId', ep.get('session_id', 'N/A')) # 兼容两种 key 的写法
                     message_id = ep.get('messageId', ep.get('message_id', 'N/A'))
                     mode = ep.get('mode', 'N/A')
                     battle_target = ep.get('battle_target', '')
                     display_mode = f"{mode} (target: {battle_target})" if mode == 'battle' and battle_target else mode
+
                     html_content += f'''
                     <div class="endpoint-entry" id="entry-{session_id}">
                         <div class="endpoint-details">
@@ -631,25 +754,15 @@ async def get_admin_page(username: str = Depends(get_current_user)):
                         .then(data => {
                             const entryElement = document.getElementById(`entry-${sessionId}`);
                             if (entryElement) {
-                                const parentGroup = entryElement.closest('.model-group');
-                                // 移除ID条目
                                 entryElement.style.transition = 'opacity 0.5s, transform 0.5s';
                                 entryElement.style.opacity = '0';
                                 entryElement.style.transform = 'translateX(-20px)';
-                                setTimeout(() => {
-                                    entryElement.remove();
-                                    // 【【【 核心修复逻辑 】】】
-                                    // 检查父分组是否还有其他ID条目
-                                    if (parentGroup && !parentGroup.querySelector('.endpoint-entry')) {
-                                        // 如果没有，也移除父分组
-                                        parentGroup.style.transition = 'opacity 0.5s';
-                                        parentGroup.style.opacity = '0';
-                                        setTimeout(() => parentGroup.remove(), 500);
-                                    }
-                                }, 500);
+                                setTimeout(() => entryElement.remove(), 500);
                             }
                         })
-                        .catch(error => { alert(`删除失败: ${error.message}`); });
+                        .catch(error => {
+                            alert(`删除失败: ${error.message}`);
+                        });
                     }
                 }
             });
