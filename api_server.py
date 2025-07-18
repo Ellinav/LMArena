@@ -495,8 +495,112 @@ async def root():
 
 @app.get("/admin", response_class=HTMLResponse)
 async def get_admin_page(username: str = Depends(get_current_user)):
-    # 此处省略管理页面的HTML生成代码以保持简洁，但它在您的文件中应保持不变
-    return HTMLResponse(content="<h1>Admin Page Placeholder</h1>") # 实际应为完整的HTML
+    """生成并返回一个美观的、带删除功能的HTML管理页面"""
+    
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="zh">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>LMArena Bridge - ID 管理后台</title>
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 2em; }
+            h1, h2 { color: #76a9fa; border-bottom: 1px solid #333; padding-bottom: 10px; }
+            .container { max-width: 1200px; margin: auto; }
+            .model-group { background-color: #1e1e1e; border: 1px solid #383838; border-radius: 8px; margin-bottom: 2em; padding: 1em 1.5em; }
+            .endpoint-entry { background-color: #2a2b32; border-left: 3px solid #4a90e2; padding: 1em; margin-top: 1em; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1em; }
+            .endpoint-details { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; font-size: 0.9em; word-break: break-all; line-height: 1.6; }
+            .delete-btn { background-color: #da3633; color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: background-color 0.2s; }
+            .delete-btn:hover { background-color: #b92521; }
+            .no-ids { font-style: italic; color: #888; padding: 1em; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>LMArena Bridge - ID 管理后台</h1>
+    """
+
+    if not MODEL_ENDPOINT_MAP:
+        html_content += "<p class='no-ids'>当前没有已捕获的ID。</p>"
+    else:
+        for model_name, endpoints in sorted(MODEL_ENDPOINT_MAP.items()):
+            html_content += f'<div class="model-group"><h2>{model_name}</h2>'
+            
+            # 【【【 核心修复逻辑 】】】
+            # 检查endpoints是列表还是单个字典，并统一处理为列表
+            endpoint_list = []
+            if isinstance(endpoints, list):
+                endpoint_list = endpoints
+            elif isinstance(endpoints, dict):
+                endpoint_list = [endpoints] # 将单个字典放入列表中
+
+            if not endpoint_list:
+                html_content += "<p class='no-ids'>此模型下没有端点。</p>"
+            else:
+                for ep in endpoint_list:
+                    # 确保 ep 是字典，如果不是则跳过，防止意外错误
+                    if not isinstance(ep, dict): continue
+
+                    session_id = ep.get('sessionId', ep.get('session_id', 'N/A')) # 兼容两种 key 的写法
+                    message_id = ep.get('messageId', ep.get('message_id', 'N/A'))
+                    mode = ep.get('mode', 'N/A')
+                    battle_target = ep.get('battle_target', '')
+                    display_mode = f"{mode} (target: {battle_target})" if mode == 'battle' and battle_target else mode
+
+                    html_content += f'''
+                    <div class="endpoint-entry" id="entry-{session_id}">
+                        <div class="endpoint-details">
+                            <strong>Session ID:</strong> {session_id}<br>
+                            <strong>Message ID:</strong> {message_id}<br>
+                            <strong>Mode:</strong> {display_mode}
+                        </div>
+                        <button class="delete-btn" data-model="{model_name}" data-session="{session_id}">删除</button>
+                    </div>
+                    '''
+            html_content += "</div>"
+
+    html_content += """
+        </div>
+        <script>
+            document.addEventListener('click', function(event) {
+                if (event.target.classList.contains('delete-btn')) {
+                    const button = event.target;
+                    const modelName = button.dataset.model;
+                    const sessionId = button.dataset.session;
+
+                    if (confirm(`确定要删除模型 '${modelName}' 下的这个 Session ID 吗？\\n${sessionId}`)) {
+                        fetch('/v1/delete-endpoint', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ modelName, sessionId })
+                        })
+                        .then(response => {
+                            if (!response.ok) {
+                                return response.json().then(err => { throw new Error(err.detail || '删除失败'); });
+                            }
+                            return response.json();
+                        })
+                        .then(data => {
+                            const entryElement = document.getElementById(`entry-${sessionId}`);
+                            if (entryElement) {
+                                entryElement.style.transition = 'opacity 0.5s, transform 0.5s';
+                                entryElement.style.opacity = '0';
+                                entryElement.style.transform = 'translateX(-20px)';
+                                setTimeout(() => entryElement.remove(), 500);
+                            }
+                        })
+                        .catch(error => {
+                            alert(`删除失败: ${error.message}`);
+                        });
+                    }
+                }
+            });
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
 
 if __name__ == "__main__":
     # 确保在运行前，存在 modules/payload_converter.py 文件
