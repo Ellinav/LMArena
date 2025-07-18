@@ -550,29 +550,39 @@ async def get_admin_login_page():
     """)
 
 @app.get("/admin", response_class=HTMLResponse)
-async def get_admin_page(): # 注意，这里没有认证依赖了！
+async def get_admin_page(): # 确保这里没有 Depends(get_current_user)
     html_content = """
     <!DOCTYPE html>
     <html lang="zh">
     <head>
         <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>LMArena Bridge - ID 管理后台</title>
         <style>
-            /* 样式保持不变 */
-            body { font-family: sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 2em; }
-            h1 { color: #76a9fa; } .model-group { background-color: #1e1e1e; border-radius: 8px; margin-bottom: 2em; padding: 1.5em; } h2 { border-bottom: 1px solid #333; padding-bottom: 10px; } .endpoint-entry { background-color: #2a2b32; border-left: 4px solid #4a90e2; padding: 1em; margin-top: 1em; display: flex; justify-content: space-between; align-items: center; } .endpoint-details { font-family: monospace; } .delete-btn { background-color: #da3633; color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; } #loading-state, #empty-state { text-align: center; margin-top: 3em; color: #888; }
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 2em; }
+            h1, h2 { color: #76a9fa; }
+            .container { max-width: 1200px; margin: auto; }
+            .model-group { background-color: #1e1e1e; border: 1px solid #383838; border-radius: 8px; margin-bottom: 2em; padding: 1.5em; overflow: hidden; transition: all 0.5s ease-out; }
+            h2 { border-bottom: 1px solid #333; padding-bottom: 10px; }
+            .endpoint-entry { background-color: #2a2b32; border-left: 4px solid #4a90e2; padding: 1em; margin-top: 1em; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1em; transition: all 0.3s ease; }
+            .endpoint-details { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; font-size: 0.9em; word-break: break-all; line-height: 1.6; }
+            .delete-btn { background-color: #da3633; color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: background-color 0.2s; }
+            .delete-btn:hover { background-color: #b92521; }
+            #loading-state, #empty-state { text-align: center; margin-top: 3em; color: #888; }
         </style>
     </head>
     <body>
         <div class="container">
             <h1>LMArena Bridge - ID 管理后台</h1>
-            <!-- 数据容器，初始为空 -->
             <div id="data-container">
                 <div id="loading-state"><h2>🔄 正在加载数据...</h2></div>
             </div>
         </div>
+
         <script>
-            // === 全新的前端逻辑 ===
+            // --- 完整的、经过验证的前端脚本 ---
+
+            // 1. 页面加载后立即执行的逻辑
             document.addEventListener('DOMContentLoaded', async function() {
                 const apiKey = localStorage.getItem('adminApiKey');
                 const dataContainer = document.getElementById('data-container');
@@ -583,7 +593,6 @@ async def get_admin_page(): # 注意，这里没有认证依赖了！
                 }
 
                 try {
-                    // 1. 使用存储的 key 去获取受保护的数据
                     const response = await fetch('/v1/get-endpoint-map', {
                         headers: { 'Authorization': `Bearer ${apiKey}` }
                     });
@@ -594,11 +603,9 @@ async def get_admin_page(): # 注意，这里没有认证依赖了！
                         window.location.href = '/admin/login';
                         return;
                     }
-                    if (!response.ok) throw new Error('获取数据失败');
+                    if (!response.ok) throw new Error('获取数据失败，服务器状态: ' + response.status);
 
                     const modelEndpointMap = await response.json();
-                    
-                    // 2. 动态渲染页面
                     renderData(modelEndpointMap);
 
                 } catch (error) {
@@ -606,6 +613,7 @@ async def get_admin_page(): # 注意，这里没有认证依赖了！
                 }
             });
 
+            // 2. 负责将数据显示在页面上的函数
             function renderData(data) {
                 const dataContainer = document.getElementById('data-container');
                 if (Object.keys(data).length === 0) {
@@ -614,22 +622,26 @@ async def get_admin_page(): # 注意，这里没有认证依赖了！
                 }
 
                 let html = '';
-                // 对模型名称进行排序
                 const sortedModelNames = Object.keys(data).sort();
 
                 for (const modelName of sortedModelNames) {
                     const endpoints = data[modelName];
-                    html += `<div class="model-group" id="group-for-${modelName}"><h2>${modelName}</h2>`;
+                    html += `<div class="model-group" id="group-for-${modelName.replace(/[^a-zA-Z0-9]/g, '-') }"><h2>${modelName}</h2>`;
                     const endpoint_list = Array.isArray(endpoints) ? endpoints : [endpoints];
                     
                     for (const ep of endpoint_list) {
                         const sessionId = ep.sessionId || ep.session_id || 'N/A';
                         const messageId = ep.messageId || ep.message_id || 'N/A';
+                        const mode = ep.mode || 'N/A';
+                        const battleTarget = ep.battle_target;
+                        const displayMode = mode === 'battle' && battleTarget ? `battle (target: ${battleTarget})` : mode;
+                        
                         html += `
                         <div class="endpoint-entry" id="entry-${sessionId}">
                             <div class="endpoint-details">
                                 <strong>Session ID:</strong> ${sessionId}<br>
-                                <strong>Message ID:</strong> ${messageId}
+                                <strong>Message ID:</strong> ${messageId}<br>
+                                <strong>Mode:</strong> ${displayMode}
                             </div>
                             <button class="delete-btn" data-model="${modelName}" data-session="${sessionId}">删除</button>
                         </div>`;
@@ -639,11 +651,67 @@ async def get_admin_page(): # 注意，这里没有认证依赖了！
                 dataContainer.innerHTML = html;
             }
 
-            // 删除逻辑保持不变，它依赖于 apiKey 变量
+            // 3. 【【【核心修复】】】 完整的点击事件监听和处理逻辑
             document.addEventListener('click', async function(event) {
+                // 我们只关心对 class 包含 'delete-btn' 的元素的点击
                 if (event.target.classList.contains('delete-btn')) {
                     const apiKey = localStorage.getItem('adminApiKey');
-                    // ... (此处粘贴之前回答中完整的、健壮的删除逻辑)
+                    if (!apiKey) {
+                        alert('无法找到认证信息，请重新登录。');
+                        window.location.href = '/admin/login';
+                        return;
+                    }
+                    
+                    const button = event.target;
+                    const modelName = button.dataset.model;
+                    const sessionId = button.dataset.session;
+
+                    // 弹出确认框
+                    if (confirm(`确定要删除模型 '${modelName}' 下的这个 Session ID 吗？\\n${sessionId}`)) {
+                        try {
+                            const response = await fetch('/v1/delete-endpoint', {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'Authorization': `Bearer ${apiKey}`
+                                },
+                                body: JSON.stringify({ modelName, sessionId })
+                            });
+
+                            if (!response.ok) {
+                                if (response.status === 401) {
+                                    alert('认证失败或已过期，请重新登录。');
+                                    window.location.href = '/admin/login';
+                                    return;
+                                }
+                                const err = await response.json();
+                                throw new Error(err.detail || '服务器返回未知错误。');
+                            }
+                            
+                            // 前端UI平滑删除逻辑
+                            const entryElement = document.getElementById(`entry-${sessionId}`);
+                            if (entryElement) {
+                                const modelGroup = entryElement.closest('.model-group');
+                                entryElement.style.transition = 'opacity 0.3s, transform 0.3s';
+                                entryElement.style.opacity = '0';
+                                entryElement.style.transform = 'translateX(-20px)';
+                                
+                                setTimeout(() => {
+                                    entryElement.remove();
+                                    if (modelGroup && !modelGroup.querySelector('.endpoint-entry')) {
+                                        modelGroup.style.maxHeight = '0px';
+                                        modelGroup.style.padding = '0';
+                                        modelGroup.style.margin = '0';
+                                        modelGroup.style.borderWidth = '0';
+                                        modelGroup.style.opacity = '0';
+                                        setTimeout(() => modelGroup.remove(), 500);
+                                    }
+                                }, 300);
+                            }
+                        } catch (error) {
+                            alert(`删除失败: ${error.message}`);
+                        }
+                    }
                 }
             });
         </script>
