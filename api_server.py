@@ -11,6 +11,7 @@ from typing import Optional, List
 
 # --- 导入自定义模块 ---
 from modules import image_generation
+from modules import payload_converter
 
 # --- 基础配置 ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -229,6 +230,7 @@ async def send_pings():
 async def lifespan(app: FastAPI):
     global main_event_loop, last_activity_time, idle_monitor_thread
     main_event_loop = asyncio.get_running_loop()
+    payload_converter.initialize_converter(response_channels)
     load_config()
     load_model_map()
     load_model_endpoint_map()
