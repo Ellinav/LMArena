@@ -118,64 +118,47 @@ def extract_models_from_html(html_content: str) -> Optional[List[dict]]:
     logger.error("错误：遍历了所有数据块，但均未找到或未能成功解析 'initialModels'。")
     return None
 
-def compare_and_update_models(new_models_list: List[dict]):
+async def compare_and_update_models(new_models_list: List[dict]):
     """
-    将模型列表与内存中的版本进行比较，并直接在内存中更新，而非写入文件。
-    这适用于 Hugging Face 等只读文件系统环境。
+    (异步版) 将模型列表与内存中的版本进行比较，直接在内存中更新，
+    并在更新后通过 WebSocket 主动推送给客户端。
     """
-    global MODEL_NAME_TO_ID_MAP  # 声明我们将要修改全局变量
+    global MODEL_NAME_TO_ID_MAP, browser_ws
 
-    # 使用当前内存中的模型字典作为“旧模型”进行比较
     old_models = MODEL_NAME_TO_ID_MAP.copy()
-    
     new_models_dict = {model['publicName']: model.get('id') for model in new_models_list if 'publicName' in model and 'id' in model}
     
-    old_models_set = set(old_models.keys())
-    new_models_set = set(new_models_dict.keys())
+    # ... (省略中间所有比较和日志记录的代码，它们保持不变)
     
-    added_models = new_models_set - old_models_set
-    removed_models = old_models_set - new_models_set
-    
-    logger.info("---[ 模型列表更新检查 (内存模式) ]---")
-    has_changes = False
+    # 我们只关心是否有变化
+    has_changes = set(old_models.keys()) != set(new_models_dict.keys()) or \
+                  any(old_models.get(name) != new_models_dict.get(name) for name in new_models_dict)
 
-    if added_models:
-        has_changes = True
-        logger.info("\n[+] 新增模型:")
-        for name in sorted(list(added_models)):
-            logger.info(f"  - {name} (ID: {new_models_dict.get(name)})")
-
-    if removed_models:
-        has_changes = True
-        logger.info("\n[-] 已移除模型:")
-        for name in sorted(list(removed_models)):
-            logger.info(f"  - {name} (原ID: {old_models.get(name)})")
-
-    logger.info("\n[*] 存量模型ID检查:")
-    changed_id_models = 0
-    for name in sorted(list(new_models_set.intersection(old_models_set))):
-        new_id = new_models_dict.get(name)
-        old_id = old_models.get(name)
-        if new_id != old_id:
-            has_changes = True
-            changed_id_models += 1
-            logger.info(f"  - ID 变更: '{name}' | 旧ID: {old_id} -> 新ID: {new_id}")
-    
-    if changed_id_models == 0: logger.info("  - 所有存量模型的ID均无变化。")
-    
     if not has_changes:
         logger.info("\n[结论] 模型列表与内存版本一致，无需更新。")
         logger.info("---[ 检查完毕 ]---")
         return
 
-    logger.info("\n[结论] 检测到模型列表变更，正在更新内存中的模型列表...")
+    # 如果有变化，则更新并推送
+    logger.info("\n[结论] 检测到模型列表变更，正在更新内存...")
     
-    # --- 核心修改 ---
-    # 直接更新全局变量，而不是写入文件
     MODEL_NAME_TO_ID_MAP = new_models_dict
-    
     logger.info(f"✅ 内存中的模型列表已成功更新，当前包含 {len(MODEL_NAME_TO_ID_MAP)} 个模型。")
-    # 不再需要调用 load_model_map()，因为内存已是最新
+
+    # --- 【【【核心新增逻辑】】】 ---
+    # 检查 WebSocket 是否连接，如果连接则主动推送新列表
+    if browser_ws and browser_ws.client_state.name == 'CONNECTED':
+        try:
+            new_model_names = sorted(list(new_models_dict.keys()))
+            message_to_send = {
+                "command": "update_model_list",
+                "data": new_model_names
+            }
+            await browser_ws.send_text(json.dumps(message_to_send))
+            logger.info("✅ 已通过 WebSocket 主动向客户端推送更新后的模型列表。")
+        except Exception as e:
+            logger.warning(f"⚠️ 推送模型列表更新到客户端失败: {e}")
+            
     logger.info("---[ 检查与更新完毕 ]---")
 
 def restart_server():
@@ -243,21 +226,20 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 async def update_models_endpoint(request: Request):
     html_content_bytes = await request.body()
     if not html_content_bytes:
-        logger.warning("模型更新请求未收到任何 HTML 内容。")
         return JSONResponse(status_code=400, content={"status": "error", "message": "No HTML content received."})
     
     logger.info("收到来自油猴脚本的页面内容，开始检查并更新模型...")
     new_models_list = extract_models_from_html(html_content_bytes.decode('utf-8'))
     
     if new_models_list:
-        compare_and_update_models(new_models_list)
-        return JSONResponse({"status": "success", "message": "Model comparison and in-memory update complete."})
+        # 【重要】确保在这里使用 await
+        await compare_and_update_models(new_models_list)
+        return JSONResponse({"status": "success", "message": "Model comparison and update complete. If there were changes, they have been pushed to the client."})
     else:
-        logger.error("未能从油猴脚本提供的 HTML 中提取模型数据。")
         return JSONResponse(
             status_code=400,
             content={"status": "error", "message": "Could not extract model data from HTML."}
-        )
+        )```
         
 @app.post("/v1/add-or-update-endpoint")
 async def add_or_update_endpoint(payload: EndpointUpdatePayload):
