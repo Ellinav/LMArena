@@ -2,10 +2,10 @@ import asyncio, json, logging, os, sys, re, threading, random, time
 from datetime import datetime
 from contextlib import asynccontextmanager
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.security import HTTPBasic, HTTPBasicCredentials, HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from typing import Optional, List
 
