@@ -3,7 +3,6 @@ import time
 import uuid
 
 # 全局变量，用于从主程序api_server.py接收response_channels字典
-# 这样我们就不需要到处传递这个参数了
 response_channels = None
 
 def initialize_converter(channels):
@@ -26,17 +25,29 @@ def convert_openai_to_lmarena_payload(
     model_name = openai_req.get("model", "")
     target_model_id = model_name_to_id_map.get(model_name, default_model_id)
     
-    # 从OpenAI请求中提取消息列表
     openai_messages = openai_req.get("messages", [])
     
     # 构建LMArena需要的message_templates
     message_templates = []
     for msg in openai_messages:
-        # 只需要role和content两个核心字段
-        message_templates.append({
+        new_msg = {
             "role": msg.get("role"),
             "content": msg.get("content")
-        })
+        }
+        
+        # --- 【【【核心修复逻辑】】】 ---
+        # 根据角色，为每条消息添加 LMArena 需要的 participantPosition 字段
+        # 这是模拟 LMArena 网站自身行为的关键
+        role = new_msg.get("role")
+        if role == "user" or role == "assistant":
+            # 用户和助手的消息，立场都设为 'a'
+            new_msg["participantPosition"] = "a"
+        elif role == "system":
+            # 系统的消息，立场设为 'b' (根据旧版代码逻辑)
+            new_msg["participantPosition"] = "b"
+        # ---------------------------------
+            
+        message_templates.append(new_msg)
 
     # 构建最终的负载
     lmarena_payload = {
@@ -46,7 +57,6 @@ def convert_openai_to_lmarena_payload(
         "message_id": message_id
     }
 
-    # 如果有battle模式的覆盖信息，也一并加入
     if mode_override:
         lmarena_payload["mode"] = mode_override
     if battle_target_override:
@@ -62,16 +72,12 @@ async def stream_generator(request_id: str, model_name: str):
     """
     try:
         while True:
-            # 从与这个请求ID关联的队列中等待数据
             data_chunk = await response_channels[request_id].get()
             
-            # 检查是否是结束信号
             if data_chunk == "[DONE]":
                 break
             
-            # 检查是否是错误信号
             if isinstance(data_chunk, dict) and 'error' in data_chunk:
-                # 在流中报告错误并终止
                 error_payload = {
                     "error": {
                         "message": data_chunk['error'],
@@ -82,7 +88,6 @@ async def stream_generator(request_id: str, model_name: str):
                 yield f"data: {json.dumps(error_payload)}\n\n"
                 break
             
-            # 构造OpenAI兼容的流式数据块
             response_json = {
                 "id": f"chatcmpl-{request_id}",
                 "object": "chat.completion.chunk",
@@ -96,10 +101,8 @@ async def stream_generator(request_id: str, model_name: str):
                     }
                 ],
             }
-            # 使用SSE格式发送
             yield f"data: {json.dumps(response_json)}\n\n"
             
-        # 发送最后一个数据块，包含finish_reason
         final_chunk = {
             "id": f"chatcmpl-{request_id}",
             "object": "chat.completion.chunk",
@@ -108,11 +111,9 @@ async def stream_generator(request_id: str, model_name: str):
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
         }
         yield f"data: {json.dumps(final_chunk)}\n\n"
-        # 发送最终的结束信号
         yield "data: [DONE]\n\n"
 
     finally:
-        # 确保无论如何都从字典中移除这个请求的队列，防止内存泄漏
         if request_id in response_channels:
             del response_channels[request_id]
 
@@ -136,7 +137,6 @@ async def non_stream_response(request_id: str, model_name: str):
         if request_id in response_channels:
             del response_channels[request_id]
 
-    # 构造OpenAI兼容的完整响应
     response_json = {
         "id": f"chatcmpl-{request_id}",
         "object": "chat.completion",
@@ -153,9 +153,8 @@ async def non_stream_response(request_id: str, model_name: str):
             }
         ],
         "usage": {
-            # 用法统计在这里无法精确计算，返回估算值
             "prompt_tokens": 0,
-            "completion_tokens": len(full_content.split()), # 简单估算
+            "completion_tokens": len(full_content.split()),
             "total_tokens": len(full_content.split()),
         },
     }
