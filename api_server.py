@@ -67,46 +67,56 @@ def load_model_map():
 
 def extract_models_from_html(html_content: str) -> Optional[List[dict]]:
     """
-    从HTML内容中提取模型数据。
-    基于用户找到的决定性证据 self.__next_f.push(...) 结构进行解析。
+    智能解析HTML：遍历所有可能的Next.js数据块，直到找到包含 'initialModels' 的那一个。
     """
-    match = re.search(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', html_content)
-    if not match:
-        logger.error("错误：在HTML响应中找不到 'self.__next_f.push' 数据块。")
-        return None
-
-    payload = match.group(1)
-    try:
-        cleaned_payload = payload.replace('\\"', '"').replace('\\\\', '\\')
-        key = '"initialModels":['
-        start_index = cleaned_payload.find(key)
-        if start_index == -1:
-            logger.error("错误：在数据块中找不到 'initialModels' 键。")
-            return None
-
-        json_str = cleaned_payload[start_index + len(key) - 1:]
-        bracket_counter = 0
-        end_index = -1
-        for i, char in enumerate(json_str):
-            if char == '[':
-                bracket_counter += 1
-            elif char == ']':
-                bracket_counter -= 1
-            if bracket_counter == 0:
-                end_index = i + 1
-                break
+    # 使用 re.finditer 遍历所有匹配项，而不是只找第一个
+    matches = re.finditer(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', html_content, re.DOTALL)
+    
+    for match in matches:
+        payload = match.group(1)
         
-        if end_index == -1:
-            logger.error("错误：未能找到 'initialModels' 数组的闭合括号。")
-            return None
+        # 关键检查：如果这个数据块里不含 "initialModels"，就跳过，继续找下一个
+        if 'initialModels' not in payload:
+            continue
 
-        final_json_array_str = json_str[:end_index]
-        models = json.loads(final_json_array_str)
-        logger.info(f"✅ 成功从HTML中提取到 {len(models)} 个模型数据！")
-        return models
-    except Exception as e:
-        logger.error(f"提取模型时发生未知错误: {e}")
-        return None
+        # 找到了正确的数据块！现在对它进行解析
+        try:
+            cleaned_payload = payload.replace('\\"', '"').replace('\\\\', '\\')
+            
+            key = '"initialModels":['
+            start_index = cleaned_payload.find(key)
+            # 理论上不会失败，因为我们已经检查过 'initialModels' 的存在，但以防万一
+            if start_index == -1: continue
+
+            # 从数组开始的位置切片
+            array_str = cleaned_payload[start_index + len(key) - 1:]
+            
+            # 通过匹配括号来精确地找到JSON数组的末尾
+            open_brackets = 0
+            for i, char in enumerate(array_str):
+                if char == '[':
+                    open_brackets += 1
+                elif char == ']':
+                    open_brackets -= 1
+                
+                # 当所有括号都闭合时，我们就找到了完整的数组
+                if open_brackets == 0:
+                    final_json_array_str = array_str[:i+1]
+                    models = json.loads(final_json_array_str)
+                    logger.info(f"✅ 成功从正确的HTML数据块中提取到 {len(models)} 个模型数据！")
+                    return models # 成功！立即返回结果
+            
+            # 如果循环结束都没找到匹配的括号，说明这个数据块有问题
+            logger.warning("找到了包含'initialModels'的数据块，但括号不匹配。将检查下一个。")
+            continue
+
+        except Exception as e:
+            logger.warning(f"找到了一个候选数据块，但解析失败: {e}。将检查下一个。")
+            continue
+            
+    # 如果遍历完所有匹配项都没有成功返回，说明真的找不到了
+    logger.error("错误：遍历了所有数据块，但均未找到或未能成功解析 'initialModels'。")
+    return None
 
 def compare_and_update_models(new_models_list: List[dict], models_path: str):
     try:
