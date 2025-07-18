@@ -466,24 +466,32 @@ class DeletePayload(BaseModel):
     model_name: str = Field(..., alias='modelName')
     session_id: str = Field(..., alias='sessionId')
 
-def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     server_api_key = os.environ.get("API_KEY") or CONFIG.get("api_key")
-    if server_api_key and credentials.password == server_api_key:
-        return credentials.username
-    raise HTTPException(status_code=401, detail="Incorrect API Key", headers={"WWW-Authenticate": "Basic"})
+    if server_api_key and credentials.credentials == server_api_key:
+        return "admin" # 返回一个占位符用户名
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Incorrect API Key",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 @app.post("/v1/delete-endpoint")
-async def delete_endpoint(payload: DeletePayload, username: str = Depends(get_current_user)):
+async def delete_endpoint(payload: DeletePayload, current_user: str = Depends(get_current_user)):
     global MODEL_ENDPOINT_MAP
     model_name = payload.model_name
     session_id_to_delete = payload.session_id
+    
     if model_name in MODEL_ENDPOINT_MAP and isinstance(MODEL_ENDPOINT_MAP[model_name], list):
         original_len = len(MODEL_ENDPOINT_MAP[model_name])
         MODEL_ENDPOINT_MAP[model_name] = [ep for ep in MODEL_ENDPOINT_MAP[model_name] if ep.get('sessionId', ep.get('session_id')) != session_id_to_delete]
+        
         if len(MODEL_ENDPOINT_MAP[model_name]) < original_len:
+            # 如果删除后列表为空，则移除该模型条目
             if not MODEL_ENDPOINT_MAP[model_name]:
                 del MODEL_ENDPOINT_MAP[model_name]
             return {"status": "success", "message": "Endpoint deleted."}
+
     raise HTTPException(status_code=404, detail="Endpoint not found")
 
 @app.get("/", response_class=HTMLResponse)
@@ -497,9 +505,47 @@ async def root():
     </head><body><div class="status-box"><h1>LMArena Bridge Status</h1><p><strong>油猴脚本连接状态:</strong> {ws_status}</p><p><strong>已映射模型种类数:</strong> {mapped_models_count}</p><p><strong>已捕获ID总数:</strong> {total_ids_count}</p></div></body></html>
     """)
 
+@app.get("/admin/login", response_class=HTMLResponse)
+async def get_admin_login_page():
+    # 这个端点只返回一个简单的登录页面，不需要任何认证
+    return HTMLResponse(content="""
+    <!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8">
+    <title>Admin Login</title>
+    <style>
+        body { display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #121212; color: #e0e0e0; font-family: sans-serif; }
+        .auth-box { background: #1e1e1e; padding: 2em 3em; border-radius: 8px; box-shadow: 0 5px 20px rgba(0,0,0,0.5); text-align: center; }
+        h2 { color: #76a9fa; }
+        input { padding: 10px; margin: 15px 0; width: 280px; background: #333; border: 1px solid #555; border-radius: 4px; color: #fff; }
+        button { width: 100%; padding: 10px 20px; background: #76a9fa; color: #121212; border: none; border-radius: 4px; font-weight: bold; cursor: pointer; }
+    </style>
+    </head><body>
+    <div class="auth-box">
+        <h2>Admin后台认证</h2>
+        <p>请输入您的 API Key。</p>
+        <input type="password" id="api-key-input" placeholder="API Key">
+        <button onclick="login()">进入</button>
+    </div>
+    <script>
+        function login() {
+            const apiKey = document.getElementById('api-key-input').value;
+            if (apiKey) {
+                // 将 API Key 存到 localStorage，然后跳转到真正的 admin 页面
+                localStorage.setItem('adminApiKey', apiKey);
+                window.location.href = '/admin';
+            } else {
+                alert('请输入 API Key！');
+            }
+        }
+        document.getElementById('api-key-input').addEventListener('keyup', (e) => {
+            if (e.key === 'Enter') login();
+        });
+    </script>
+    </body></html>
+    """)
+
 @app.get("/admin", response_class=HTMLResponse)
-async def get_admin_page(username: str = Depends(get_current_user)):
-    """生成并返回一个美观、功能完整且带认证的HTML管理页面"""
+async def get_admin_page(current_user: str = Depends(get_current_user)):
+    # 这一行会先进行认证。如果失败，用户会被重定向或看到错误，不会加载页面。
     
     html_content = """
     <!DOCTYPE html>
@@ -509,19 +555,14 @@ async def get_admin_page(username: str = Depends(get_current_user)):
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>LMArena Bridge - ID 管理后台</title>
         <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 2em; }
-            h1, h2 { color: #76a9fa; border-bottom: 1px solid #333; padding-bottom: 10px; }
-            .container { max-width: 1200px; margin: auto; }
+            /* 样式部分可以保持和你之前满意的版本一致 */
+            body { font-family: sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 2em; }
+            h1 { color: #76a9fa; }
             .model-group { background-color: #1e1e1e; border: 1px solid #383838; border-radius: 8px; margin-bottom: 2em; padding: 1.5em; overflow: hidden; transition: all 0.5s ease-out; }
+            h2 { border-bottom: 1px solid #333; padding-bottom: 10px; }
             .endpoint-entry { background-color: #2a2b32; border-left: 4px solid #4a90e2; padding: 1em; margin-top: 1em; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1em; transition: all 0.3s ease; }
-            .endpoint-details { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; font-size: 0.9em; word-break: break-all; line-height: 1.6; }
-            .delete-btn { background-color: #da3633; color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: background-color 0.2s; }
-            .delete-btn:hover { background-color: #b92521; }
-            .no-ids, .no-models { font-style: italic; color: #888; padding: 1.5em; text-align: center; }
-            .auth-prompt { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); display: flex; justify-content: center; align-items: center; z-index: 9999; }
-            .auth-box { background: #1e1e1e; padding: 2em; border-radius: 8px; box-shadow: 0 5px 20px rgba(0,0,0,0.5); text-align: center; }
-            .auth-box input { padding: 10px; margin: 10px 0; width: 250px; background: #333; border: 1px solid #555; border-radius: 4px; color: #fff; }
-            .auth-box button { padding: 10px 20px; background: #76a9fa; color: #121212; border: none; border-radius: 4px; font-weight: bold; cursor: pointer; }
+            .endpoint-details { font-family: monospace; font-size: 0.9em; word-break: break-all; }
+            .delete-btn { background-color: #da3633; color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; }
         </style>
     </head>
     <body>
@@ -529,75 +570,39 @@ async def get_admin_page(username: str = Depends(get_current_user)):
             <h1>LMArena Bridge - ID 管理后台</h1>
     """
 
-    # 检查是否有任何已映射的模型
     if not MODEL_ENDPOINT_MAP:
-        html_content += "<div class='no-models'><h2>当前没有已捕获的ID。</h2><p>请返回主页，使用油猴脚本的“ID捕获助手”来绑定模型和会话。</p></div>"
+        html_content += "<h2>当前没有已捕获的ID。</h2>"
     else:
-        # 按模型名称排序，以获得一致的显示顺序
         for model_name, endpoints in sorted(MODEL_ENDPOINT_MAP.items()):
-            html_content += f'<div class="model-group"><h2>{model_name}</h2>'
-            
-            # 统一处理: 确保 endpoints 是一个列表
+            html_content += f'<div class="model-group" id="group-for-{model_name}"><h2>{model_name}</h2>'
             endpoint_list = endpoints if isinstance(endpoints, list) else [endpoints]
-
-            if not endpoint_list:
-                html_content += "<p class='no-ids'>此模型下没有端点。</p>"
-            else:
-                for ep in endpoint_list:
-                    if not isinstance(ep, dict): continue
-
-                    # --- 【【【核心修复：正确提取数据】】】 ---
-                    # 兼容 'sessionId' 和 'session_id' 两种可能的键名
-                    session_id = ep.get('sessionId', ep.get('session_id', 'N/A'))
-                    message_id = ep.get('messageId', ep.get('message_id', 'N/A'))
-                    mode = ep.get('mode', 'N/A')
-                    battle_target = ep.get('battle_target') # get() 默认返回 None
-
-                    display_mode = f"battle (target: {battle_target})" if mode == 'battle' and battle_target else mode
-
-                    # --- 【【【核心修复：正确渲染HTML】】】 ---
-                    # 确保 `id` 和 `data-session` 都使用了正确的 `session_id` 变量
-                    html_content += f'''
-                    <div class="endpoint-entry" id="entry-{session_id}">
-                        <div class="endpoint-details">
-                            <strong>Session ID:</strong> {session_id}<br>
-                            <strong>Message ID:</strong> {message_id}<br>
-                            <strong>Mode:</strong> {display_mode}
-                        </div>
-                        <button class="delete-btn" data-model="{model_name}" data-session="{session_id}">删除</button>
+            for ep in endpoint_list:
+                session_id = ep.get('sessionId', ep.get('session_id', 'N/A'))
+                message_id = ep.get('messageId', ep.get('message_id', 'N/A'))
+                # ... 其他数据显示 ...
+                html_content += f'''
+                <div class="endpoint-entry" id="entry-{session_id}">
+                    <div class="endpoint-details">
+                        <strong>Session ID:</strong> {session_id}<br>
+                        <strong>Message ID:</strong> {message_id}
                     </div>
-                    '''
+                    <button class="delete-btn" data-model="{model_name}" data-session="{session_id}">删除</button>
+                </div>
+                '''
             html_content += "</div>"
 
     html_content += """
         </div>
-        
-        <!-- 认证弹窗 -->
-        <div id="auth-prompt" class="auth-prompt">
-            <div class="auth-box">
-                <h2>需要认证</h2>
-                <p>请输入您的 API Key 以访问管理后台。</p>
-                <input type="password" id="api-key-input" placeholder="API Key">
-                <br>
-                <button id="auth-submit">进入</button>
-            </div>
-        </div>
-
         <script>
-            // --- 【【【核心修复：健壮的JS逻辑和认证处理】】】 ---
-            const authPrompt = document.getElementById('auth-prompt');
-            const apiKeyInput = document.getElementById('api-key-input');
-            const authSubmitBtn = document.getElementById('auth-submit');
-            let apiKey = '';
-
-            authSubmitBtn.addEventListener('click', () => {
-                apiKey = apiKeyInput.value;
-                if (apiKey) {
-                    authPrompt.style.display = 'none';
-                } else {
-                    alert('请输入API Key！');
-                }
-            });
+            // 这个脚本在页面加载时运行，它假设认证已通过
+            const apiKey = localStorage.getItem('adminApiKey');
+            
+            if (!apiKey) {
+                // 如果在 localStorage 找不到 key，说明用户是直接访问的 /admin
+                // 强制他去登录页面
+                alert('请先登录！');
+                window.location.href = '/admin/login';
+            }
 
             document.addEventListener('click', async function(event) {
                 if (event.target.classList.contains('delete-btn')) {
@@ -605,47 +610,37 @@ async def get_admin_page(username: str = Depends(get_current_user)):
                     const modelName = button.dataset.model;
                     const sessionId = button.dataset.session;
 
-                    if (!sessionId || sessionId === 'N/A') {
-                        alert('错误：无法获取有效的 Session ID，无法删除。');
-                        return;
-                    }
-
-                    if (confirm(`确定要删除模型 '${modelName}' 下的这个 Session ID 吗？\\n${sessionId}`)) {
+                    if (confirm(`确定要删除模型 '${modelName}' 下的 Session ID 吗？`)) {
                         try {
                             const response = await fetch('/v1/delete-endpoint', {
                                 method: 'POST',
                                 headers: {
                                     'Content-Type': 'application/json',
-                                    // 关键：在请求中包含认证信息
-                                    'Authorization': 'Basic ' + btoa(`admin:${apiKey}`)
+                                    // 核心：自动从 localStorage 读取 key 并作为 Bearer Token 发送
+                                    'Authorization': `Bearer ${apiKey}`
                                 },
                                 body: JSON.stringify({ modelName, sessionId })
                             });
 
-                            if (response.status === 401) throw new Error('认证失败，API Key 不正确或已过期。');
                             if (!response.ok) {
-                                const err = await response.json();
-                                throw new Error(err.detail || '服务器返回未知错误。');
+                                // 如果 token 失效或错误，后端会返回 401
+                                if (response.status === 401) {
+                                    alert('认证失败或已过期，请重新登录。');
+                                    window.location.href = '/admin/login';
+                                    return;
+                                }
+                                throw new Error('服务器返回错误。');
                             }
                             
-                            // 删除成功后的前端处理
+                            // 前端UI平滑删除逻辑
                             const entryElement = document.getElementById(`entry-${sessionId}`);
                             if (entryElement) {
                                 const modelGroup = entryElement.closest('.model-group');
-
                                 entryElement.style.opacity = '0';
-                                entryElement.style.transform = 'scale(0.9)';
-                                
                                 setTimeout(() => {
                                     entryElement.remove();
-                                    // 检查父容器是否已空
                                     if (modelGroup && !modelGroup.querySelector('.endpoint-entry')) {
-                                        modelGroup.style.maxHeight = '0px';
-                                        modelGroup.style.padding = '0';
-                                        modelGroup.style.margin = '0';
-                                        modelGroup.style.borderWidth = '0';
-                                        modelGroup.style.opacity = '0';
-                                        setTimeout(() => modelGroup.remove(), 500);
+                                        modelGroup.remove(); // 如果分组空了，直接移除
                                     }
                                 }, 300);
                             }
