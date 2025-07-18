@@ -1,4 +1,4 @@
-import asyncio, json, logging, os, sys, re, threading, random
+import asyncio, json, logging, os, sys, re, threading, random, time # <--- 【【【 修复1: 重新导入 time 模块 】】】
 from datetime import datetime
 from contextlib import asynccontextmanager
 import uvicorn
@@ -66,10 +66,6 @@ def load_model_map():
         MODEL_NAME_TO_ID_MAP = {}
 
 def compare_and_update_models(new_model_names: List[str], models_path: str):
-    """
-    接收一个模型名称列表，与现有 models.json 比对，并更新文件。
-    新的 models.json 将采用 { "model_name": "model_name" } 的格式。
-    """
     try:
         if os.path.exists(models_path) and os.path.getsize(models_path) > 0:
             with open(models_path, 'r', encoding='utf-8') as f:
@@ -220,9 +216,6 @@ async def import_map(request: Request):
 
 @app.post("/update_models")
 async def update_models_endpoint(request: Request):
-    """
-    接收来自油猴脚本拦截到的模型名称列表 (JSON数组)，并进行比对和更新。
-    """
     try:
         model_name_list = await request.json()
         if not isinstance(model_name_list, list):
