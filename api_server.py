@@ -461,19 +461,20 @@ async def start_id_capture():
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to send command via WebSocket.")
 
-security = HTTPBasic()
+security = HTTPBearer()
 class DeletePayload(BaseModel):
     model_name: str = Field(..., alias='modelName')
     session_id: str = Field(..., alias='sessionId')
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     server_api_key = os.environ.get("API_KEY") or CONFIG.get("api_key")
+    # 访问 .credentials 属性是正确的，因为 security 是 HTTPBearer()
     if server_api_key and credentials.credentials == server_api_key:
-        return "admin" # 返回一个占位符用户名
+        return "admin"
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Incorrect API Key",
-        headers={"WWW-Authenticate": "Bearer"},
+        headers={"WWW-authenticate": "Bearer"},
     )
 
 @app.post("/v1/delete-endpoint")
