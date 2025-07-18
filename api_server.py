@@ -118,23 +118,25 @@ def extract_models_from_html(html_content: str) -> Optional[List[dict]]:
     logger.error("错误：遍历了所有数据块，但均未找到或未能成功解析 'initialModels'。")
     return None
 
-def compare_and_update_models(new_models_list: List[dict], models_path: str):
-    try:
-        if os.path.exists(models_path) and os.path.getsize(models_path) > 0:
-            with open(models_path, 'r', encoding='utf-8') as f:
-                old_models = json.load(f)
-        else:
-            old_models = {}
-    except (FileNotFoundError, json.JSONDecodeError):
-        old_models = {}
+def compare_and_update_models(new_models_list: List[dict]):
+    """
+    将模型列表与内存中的版本进行比较，并直接在内存中更新，而非写入文件。
+    这适用于 Hugging Face 等只读文件系统环境。
+    """
+    global MODEL_NAME_TO_ID_MAP  # 声明我们将要修改全局变量
 
+    # 使用当前内存中的模型字典作为“旧模型”进行比较
+    old_models = MODEL_NAME_TO_ID_MAP.copy()
+    
     new_models_dict = {model['publicName']: model.get('id') for model in new_models_list if 'publicName' in model and 'id' in model}
+    
     old_models_set = set(old_models.keys())
     new_models_set = set(new_models_dict.keys())
+    
     added_models = new_models_set - old_models_set
     removed_models = old_models_set - new_models_set
     
-    logger.info("---[ 模型列表更新检查 (HTML模式) ]---")
+    logger.info("---[ 模型列表更新检查 (内存模式) ]---")
     has_changes = False
 
     if added_models:
@@ -160,19 +162,20 @@ def compare_and_update_models(new_models_list: List[dict], models_path: str):
             logger.info(f"  - ID 变更: '{name}' | 旧ID: {old_id} -> 新ID: {new_id}")
     
     if changed_id_models == 0: logger.info("  - 所有存量模型的ID均无变化。")
+    
     if not has_changes:
-        logger.info("\n[结论] 模型列表与本地版本一致，无需更新。")
+        logger.info("\n[结论] 模型列表与内存版本一致，无需更新。")
         logger.info("---[ 检查完毕 ]---")
         return
 
-    logger.info("\n[结论] 检测到模型列表变更，正在更新 'models.json'...")
-    try:
-        with open(models_path, 'w', encoding='utf-8') as f:
-            json.dump(new_models_dict, f, indent=4, ensure_ascii=False, sort_keys=True)
-        logger.info(f"✅ 'models.json' 已成功更新，当前包含 {len(new_models_dict)} 个模型。")
-        load_model_map()
-    except IOError as e:
-        logger.error(f"❌ 写入 '{models_path}' 文件时出错: {e}")
+    logger.info("\n[结论] 检测到模型列表变更，正在更新内存中的模型列表...")
+    
+    # --- 核心修改 ---
+    # 直接更新全局变量，而不是写入文件
+    MODEL_NAME_TO_ID_MAP = new_models_dict
+    
+    logger.info(f"✅ 内存中的模型列表已成功更新，当前包含 {len(MODEL_NAME_TO_ID_MAP)} 个模型。")
+    # 不再需要调用 load_model_map()，因为内存已是最新
     logger.info("---[ 检查与更新完毕 ]---")
 
 def restart_server():
@@ -247,8 +250,8 @@ async def update_models_endpoint(request: Request):
     new_models_list = extract_models_from_html(html_content_bytes.decode('utf-8'))
     
     if new_models_list:
-        compare_and_update_models(new_models_list, 'models.json')
-        return JSONResponse({"status": "success", "message": "Model comparison and update complete."})
+        compare_and_update_models(new_models_list)
+        return JSONResponse({"status": "success", "message": "Model comparison and in-memory update complete."})
     else:
         logger.error("未能从油猴脚本提供的 HTML 中提取模型数据。")
         return JSONResponse(
