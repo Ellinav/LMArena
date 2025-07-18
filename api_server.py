@@ -480,20 +480,53 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 @app.post("/v1/delete-endpoint")
 async def delete_endpoint(payload: DeletePayload, current_user: str = Depends(get_current_user)):
     global MODEL_ENDPOINT_MAP
-    model_name = payload.model_name
-    session_id_to_delete = payload.session_id
     
-    if model_name in MODEL_ENDPOINT_MAP and isinstance(MODEL_ENDPOINT_MAP[model_name], list):
-        original_len = len(MODEL_ENDPOINT_MAP[model_name])
-        MODEL_ENDPOINT_MAP[model_name] = [ep for ep in MODEL_ENDPOINT_MAP[model_name] if ep.get('sessionId', ep.get('session_id')) != session_id_to_delete]
-        
-        if len(MODEL_ENDPOINT_MAP[model_name]) < original_len:
-            # 如果删除后列表为空，则移除该模型条目
-            if not MODEL_ENDPOINT_MAP[model_name]:
-                del MODEL_ENDPOINT_MAP[model_name]
-            return {"status": "success", "message": "Endpoint deleted."}
+    # --- 防御性编程：清理输入数据 ---
+    model_name_from_client = payload.model_name.strip()
+    session_id_to_delete = payload.session_id.strip()
 
-    raise HTTPException(status_code=404, detail="Endpoint not found")
+    logger.info(f"收到删除请求: 模型='{model_name_from_client}', SessionID='{session_id_to_delete}'")
+
+    # --- 健壮的匹配逻辑 ---
+    # 遍历所有的key，同样进行.strip()处理，以忽略存储时的潜在空格问题
+    found_model_key = None
+    for key in MODEL_ENDPOINT_MAP.keys():
+        if key.strip() == model_name_from_client:
+            found_model_key = key
+            break
+            
+    if found_model_key and isinstance(MODEL_ENDPOINT_MAP[found_model_key], list):
+        endpoints = MODEL_ENDPOINT_MAP[found_model_key]
+        original_len = len(endpoints)
+        
+        # 在比较 sessionId 时也使用 .strip()
+        new_endpoints = [
+            ep for ep in endpoints 
+            if ep.get('sessionId', ep.get('session_id', '')).strip() != session_id_to_delete
+        ]
+        
+        # 检查是否有条目被成功删除
+        if len(new_endpoints) < original_len:
+            logger.info(f"成功在模型 '{found_model_key}' 中匹配并移除了 SessionID: {session_id_to_delete}")
+            
+            # 如果删除后列表变空，则移除整个模型条目
+            if not new_endpoints:
+                del MODEL_ENDPOINT_MAP[found_model_key]
+                logger.info(f"模型 '{found_model_key}' 的端点列表已空，已将其从映射中移除。")
+            else:
+                MODEL_ENDPOINT_MAP[found_model_key] = new_endpoints
+                
+            return {"status": "success", "message": "Endpoint deleted."}
+        else:
+            # 进入了模型，但没找到匹配的 session_id
+            logger.warning(f"在模型 '{found_model_key}' 中未找到要删除的 SessionID: '{session_id_to_delete}'。")
+            logger.warning(f"该模型下现有的 SessionID 列表: {[ep.get('sessionId', ep.get('session_id')).strip() for ep in endpoints]}")
+
+
+    # 如果代码执行到这里，说明连模型名称都没匹配上
+    logger.error(f"删除失败：无法在 MODEL_ENDPOINT_MAP 中找到匹配的模型 '{model_name_from_client}'。")
+    logger.error(f"当前所有模型键名: {list(MODEL_ENDPOINT_MAP.keys())}")
+    raise HTTPException(status_code=404, detail="Endpoint not found: Model name does not match or list is empty.")
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
