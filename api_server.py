@@ -85,24 +85,31 @@ def extract_models_from_html(html_content):
     
     for script_content in script_contents:
         if 'self.__next_f.push' in script_content and 'initialState' in script_content and 'publicName' in script_content:
+            # 正则表达式保持不变，它能正确捕获整个数据块
             match = re.search(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', script_content, re.DOTALL)
             if not match:
                 continue
             
             full_payload = match.group(1)
             
-            payload_string = full_payload.split('\\n')[0]
+            # 【【【 核心修复 v2 】】】
+            # LMArena可能在模型数据字符串中加入了换行符 (\n)。
+            # 旧的 .split('\\n')[0] 会导致数据被截断。
+            # 新的方法是直接移除所有 \n，将数据重新拼接成一行进行处理。
+            payload_string = full_payload.replace('\\n', '')
             
             json_start_index = payload_string.find(':')
             if json_start_index == -1:
                 continue
             
+            # 后续逻辑保持不变，因为它们是基于单行数据设计的
             json_string_with_escapes = payload_string[json_start_index + 1:]
             json_string = json_string_with_escapes.replace('\\"', '"')
             
             try:
                 data = json.loads(json_string)
                 
+                # 递归查找模型的函数保持不变
                 def find_initial_state(obj):
                     if isinstance(obj, dict):
                         for key, value in obj.items():
@@ -124,6 +131,7 @@ def extract_models_from_html(html_content):
                     logger.info(f"成功从脚本块中提取到 {len(models)} 个模型。")
                     return models
             except json.JSONDecodeError as e:
+                # 这里的日志现在对于调试至关重要
                 logger.error(f"解析提取的JSON字符串时出错: {e}")
                 continue
 
