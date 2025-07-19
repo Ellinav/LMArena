@@ -1,4 +1,4 @@
-import asyncio, json, logging, os, sys, re, threading, random, time, uuid
+import asyncio, json, logging, os, sys, re, threading, random, time
 from datetime import datetime
 from contextlib import asynccontextmanager
 import uvicorn
@@ -11,7 +11,6 @@ from typing import Optional, List
 
 # --- 导入自定义模块 ---
 from modules import image_generation
-from modules import payload_converter
 
 # --- 基础配置 ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -46,6 +45,17 @@ def load_model_endpoint_map():
         logger.info(f"成功从 'model_endpoint_map.json' 加载了 {len(MODEL_ENDPOINT_MAP)} 个模型端点映射。")
     except (FileNotFoundError, json.JSONDecodeError):
         MODEL_ENDPOINT_MAP = {}
+
+def save_model_endpoint_map():
+    """将内存中的MODEL_ENDPOINT_MAP字典保存回json文件。"""
+    try:
+        # 使用 'w' 模式来覆盖写入，确保文件内容是内存的最新快照
+        with open('model_endpoint_map.json', 'w', encoding='utf-8') as f:
+            # indent=2让JSON文件格式化，更易读
+            json.dump(MODEL_ENDPOINT_MAP, f, indent=2, ensure_ascii=False)
+        logger.info("✅ 成功将最新的ID地图保存到 model_endpoint_map.json。")
+    except Exception as e:
+        logger.error(f"❌ 写入 model_endpoint_map.json 文件时发生错误: {e}")
 
 def load_config():
     global CONFIG
@@ -230,7 +240,6 @@ async def send_pings():
 async def lifespan(app: FastAPI):
     global main_event_loop, last_activity_time, idle_monitor_thread
     main_event_loop = asyncio.get_running_loop()
-    payload_converter.initialize_converter(response_channels)
     load_config()
     load_model_map()
     load_model_endpoint_map()
@@ -266,26 +275,35 @@ async def update_models_endpoint(request: Request):
         
 @app.post("/v1/add-or-update-endpoint")
 async def add_or_update_endpoint(payload: EndpointUpdatePayload):
-    # ... 此函数及以下所有其他端点和类的代码都保持原样，无需修改 ...
-    # 为了保证这是您可以直接使用的完整文件，此处将包含所有代码
     global MODEL_ENDPOINT_MAP
     new_entry = payload.dict(exclude_none=True, by_alias=True)
     model_name = new_entry.pop("modelName")
+
+    # 如果模型是第一次出现，创建一个新列表
     if model_name not in MODEL_ENDPOINT_MAP:
         MODEL_ENDPOINT_MAP[model_name] = [new_entry]
         logger.info(f"成功为新模型 '{model_name}' 创建了新的端点映射列表。")
+        save_model_endpoint_map()  # 保存更改
         return {"status": "success", "message": f"Endpoint for {model_name} created."}
+
+    # 如果模型已存在且其值是列表
     if isinstance(MODEL_ENDPOINT_MAP.get(model_name), list):
         endpoints = MODEL_ENDPOINT_MAP[model_name]
         new_session_id = new_entry.get('sessionId')
+        
+        # 检查重复
         is_duplicate = any(ep.get('sessionId') == new_session_id for ep in endpoints)
+        
         if not is_duplicate:
             endpoints.append(new_entry)
             logger.info(f"成功为模型 '{model_name}' 追加了一个新的端点映射。")
+            save_model_endpoint_map()  # 保存更改
             return {"status": "success", "message": f"New endpoint for {model_name} appended."}
         else:
             logger.info(f"检测到重复的 Session ID，已为模型 '{model_name}' 忽略本次添加。")
             return {"status": "skipped", "message": "Duplicate endpoint ignored."}
+            
+    # 如果数据结构不正确，记录错误
     logger.error(f"为模型 '{model_name}' 添加端点时发生错误：数据结构不是预期的列表。")
     raise HTTPException(status_code=500, detail="Internal data structure error.")
 
@@ -508,6 +526,7 @@ async def delete_endpoint(payload: DeletePayload, current_user: str = Depends(ge
             # 匹配成功，直接删除整个模型条目
             del MODEL_ENDPOINT_MAP[found_model_key]
             logger.info(f"成功删除模型 '{found_model_key}' 的单个字典条目 (SessionID: {session_id_to_delete})。")
+            save_model_endpoint_map()
             return {"status": "success", "message": "Endpoint (single entry) deleted."}
         else:
             # 不匹配
@@ -529,7 +548,7 @@ async def delete_endpoint(payload: DeletePayload, current_user: str = Depends(ge
                 logger.info(f"模型 '{found_model_key}' 的端点列表已空，已将其从映射中移除。")
             else:
                 MODEL_ENDPOINT_MAP[found_model_key] = new_endpoints
-                
+            save_model_endpoint_map()    
             return {"status": "success", "message": "Endpoint (from list) deleted."}
         else:
             logger.warning(f"在模型 '{found_model_key}' 的列表中未找到要删除的 SessionID: '{session_id_to_delete}'。")
@@ -602,82 +621,98 @@ async def get_admin_page(): # 确保这里没有 Depends(get_current_user)
         <title>LMArena Bridge - ID 管理后台</title>
         <style>
             body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 2em; }
-            h1, h2 { color: #76a9fa; }
             .container { max-width: 1200px; margin: auto; }
-            .model-group { background-color: #1e1e1e; border: 1px solid #383838; border-radius: 8px; margin-bottom: 2em; padding: 1.5em; overflow: hidden; transition: all 0.5s ease-out; }
+            .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1em; flex-wrap: wrap; gap: 1em;}
+            h1 { color: #76a9fa; margin: 0;}
+            #export-btn { background-color: #388e3c; color: white; border: none; padding: 10px 15px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: background-color 0.2s; }
+            #export-btn:hover { background-color: #2e7d32; }
+            #export-btn:disabled { background-color: #555; cursor: not-allowed; opacity: 0.7; }
+            .model-group { background-color: #1e1e1e; border: 1px solid #383838; border-radius: 8px; margin-bottom: 2em; padding: 1.5em; overflow: hidden; }
             h2 { border-bottom: 1px solid #333; padding-bottom: 10px; }
-            .endpoint-entry { background-color: #2a2b32; border-left: 4px solid #4a90e2; padding: 1em; margin-top: 1em; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1em; transition: all 0.3s ease; }
+            .endpoint-entry { background-color: #2a2b32; border-left: 4px solid #4a90e2; padding: 1em; margin-top: 1em; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1em; }
             .endpoint-details { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; font-size: 0.9em; word-break: break-all; line-height: 1.6; }
-            .delete-btn { background-color: #da3633; color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: background-color 0.2s; }
+            .delete-btn { background-color: #da3633; color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; font-weight: bold; }
             .delete-btn:hover { background-color: #b92521; }
             #loading-state, #empty-state { text-align: center; margin-top: 3em; color: #888; }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>LMArena Bridge - ID 管理后台</h1>
+            <div class="header">
+                <h1>LMArena Bridge - ID 管理后台</h1>
+                <button id="export-btn" disabled>导出为JSON</button>
+            </div>
             <div id="data-container">
                 <div id="loading-state"><h2>🔄 正在加载数据...</h2></div>
             </div>
         </div>
 
         <script>
-            // --- 完整的、经过验证的前端脚本 ---
+            let modelEndpointMapData = null; // 全局变量，用于存储从API获取的数据
+            const exportButton = document.getElementById('export-btn');
 
-            // 1. 页面加载后立即执行的逻辑
+            // --- 新增功能：导出JSON ---
+            exportButton.addEventListener('click', function() {
+                if (!modelEndpointMapData || Object.keys(modelEndpointMapData).length === 0) {
+                    alert('没有数据可导出！');
+                    return;
+                }
+                const dataStr = JSON.stringify(modelEndpointMapData, null, 2); // 格式化JSON
+                const dataBlob = new Blob([dataStr], { type: 'application/json;charset=utf-8' });
+                const url = URL.createObjectURL(dataBlob);
+                
+                const a = document.createElement('a');
+                a.href = url;
+                const date = new Date().toISOString().slice(0, 10); // 获取 YYYY-MM-DD
+                a.download = `model_endpoint_map_${date}.json`; // 添加日期到文件名
+                document.body.appendChild(a);
+                a.click(); // 触发下载
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url); // 释放内存
+            });
+
+            // --- 原有逻辑 ---
             document.addEventListener('DOMContentLoaded', async function() {
                 const apiKey = localStorage.getItem('adminApiKey');
                 const dataContainer = document.getElementById('data-container');
-
-                if (!apiKey) {
-                    window.location.href = '/admin/login';
-                    return;
-                }
+                if (!apiKey) { window.location.href = '/admin/login'; return; }
 
                 try {
-                    const response = await fetch('/v1/get-endpoint-map', {
-                        headers: { 'Authorization': `Bearer ${apiKey}` }
-                    });
-
-                    if (response.status === 401) {
-                        alert('认证失败或已过期，请重新登录。');
-                        localStorage.removeItem('adminApiKey');
-                        window.location.href = '/admin/login';
-                        return;
-                    }
+                    const response = await fetch('/v1/get-endpoint-map', { headers: { 'Authorization': `Bearer ${apiKey}` } });
+                    if (response.status === 401) { alert('认证失败，请重新登录。'); localStorage.removeItem('adminApiKey'); window.location.href = '/admin/login'; return; }
                     if (!response.ok) throw new Error('获取数据失败，服务器状态: ' + response.status);
-
-                    const modelEndpointMap = await response.json();
-                    renderData(modelEndpointMap);
-
+                    const data = await response.json();
+                    renderData(data);
                 } catch (error) {
                     dataContainer.innerHTML = `<div id="empty-state"><h2>❌ 加载数据失败</h2><p>${error.message}</p></div>`;
+                    exportButton.disabled = true;
                 }
             });
 
-            // 2. 负责将数据显示在页面上的函数
             function renderData(data) {
+                modelEndpointMapData = data; // 保存数据到全局变量
                 const dataContainer = document.getElementById('data-container');
+                
                 if (Object.keys(data).length === 0) {
                     dataContainer.innerHTML = `<div id="empty-state"><h2>当前没有已捕获的ID。</h2></div>`;
+                    exportButton.disabled = true; // 如果没数据，禁用导出按钮
                     return;
                 }
-
+                
+                exportButton.disabled = false; // 如果有数据，启用导出按钮
                 let html = '';
                 const sortedModelNames = Object.keys(data).sort();
-
+                // ... 此处开始的渲染逻辑与你文件中已有的完全相同 ...
                 for (const modelName of sortedModelNames) {
                     const endpoints = data[modelName];
                     html += `<div class="model-group" id="group-for-${modelName.replace(/[^a-zA-Z0-9]/g, '-') }"><h2>${modelName}</h2>`;
                     const endpoint_list = Array.isArray(endpoints) ? endpoints : [endpoints];
-                    
                     for (const ep of endpoint_list) {
                         const sessionId = ep.sessionId || ep.session_id || 'N/A';
                         const messageId = ep.messageId || ep.message_id || 'N/A';
                         const mode = ep.mode || 'N/A';
                         const battleTarget = ep.battle_target;
                         const displayMode = mode === 'battle' && battleTarget ? `battle (target: ${battleTarget})` : mode;
-                        
                         html += `
                         <div class="endpoint-entry" id="entry-${sessionId}">
                             <div class="endpoint-details">
@@ -693,62 +728,41 @@ async def get_admin_page(): # 确保这里没有 Depends(get_current_user)
                 dataContainer.innerHTML = html;
             }
 
-            // 3. 【【【核心修复】】】 完整的点击事件监听和处理逻辑
             document.addEventListener('click', async function(event) {
-                // 我们只关心对 class 包含 'delete-btn' 的元素的点击
                 if (event.target.classList.contains('delete-btn')) {
                     const apiKey = localStorage.getItem('adminApiKey');
-                    if (!apiKey) {
-                        alert('无法找到认证信息，请重新登录。');
-                        window.location.href = '/admin/login';
-                        return;
-                    }
+                    if (!apiKey) { alert('认证信息丢失，请重新登录。'); window.location.href = '/admin/login'; return; }
                     
                     const button = event.target;
                     const modelName = button.dataset.model;
                     const sessionId = button.dataset.session;
 
-                    // 弹出确认框
                     if (confirm(`确定要删除模型 '${modelName}' 下的这个 Session ID 吗？\\n${sessionId}`)) {
+                        // ... 删除逻辑与你文件中已有的完全相同 ...
                         try {
                             const response = await fetch('/v1/delete-endpoint', {
                                 method: 'POST',
-                                headers: {
-                                    'Content-Type': 'application/json',
-                                    'Authorization': `Bearer ${apiKey}`
-                                },
+                                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
                                 body: JSON.stringify({ modelName, sessionId })
                             });
 
                             if (!response.ok) {
-                                if (response.status === 401) {
-                                    alert('认证失败或已过期，请重新登录。');
-                                    window.location.href = '/admin/login';
-                                    return;
-                                }
+                                if (response.status === 401) { alert('认证失败，请重新登录。'); window.location.href = '/admin/login'; return; }
                                 const err = await response.json();
                                 throw new Error(err.detail || '服务器返回未知错误。');
                             }
                             
-                            // 前端UI平滑删除逻辑
                             const entryElement = document.getElementById(`entry-${sessionId}`);
                             if (entryElement) {
                                 const modelGroup = entryElement.closest('.model-group');
-                                entryElement.style.transition = 'opacity 0.3s, transform 0.3s';
-                                entryElement.style.opacity = '0';
-                                entryElement.style.transform = 'translateX(-20px)';
-                                
-                                setTimeout(() => {
-                                    entryElement.remove();
-                                    if (modelGroup && !modelGroup.querySelector('.endpoint-entry')) {
-                                        modelGroup.style.maxHeight = '0px';
-                                        modelGroup.style.padding = '0';
-                                        modelGroup.style.margin = '0';
-                                        modelGroup.style.borderWidth = '0';
-                                        modelGroup.style.opacity = '0';
-                                        setTimeout(() => modelGroup.remove(), 500);
-                                    }
-                                }, 300);
+                                entryElement.remove(); // 简单移除
+                                if (modelGroup && !modelGroup.querySelector('.endpoint-entry')) {
+                                    modelGroup.remove();
+                                }
+                                // 检查是否所有组都已删除
+                                if (document.querySelectorAll('.model-group').length === 0) {
+                                    renderData({}); // 重新渲染以显示空状态
+                                }
                             }
                         } catch (error) {
                             alert(`删除失败: ${error.message}`);
