@@ -1,11 +1,8 @@
 name: Docker Image CI
 
 on:
-  # 当有代码推送到main分支时，自动运行
   push:
     branches: [ "main" ]
-  
-  # 新增：允许你在Actions页面手动触发此工作流
   workflow_dispatch:
 
 jobs:
@@ -19,23 +16,22 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
+    # 新增步骤：将仓库名称转换为全小写，并存入环境变量
+    - name: Set repository name to lowercase
+      run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
     - name: Log in to the Container registry
       uses: docker/login-action@v3
       with:
         registry: ghcr.io
-        username: ${{ github.repository_owner }}
+        # 使用 github.actor 更为稳妥
+        username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Extract metadata (tags, labels) for Docker
-      id: meta
-      uses: docker/metadata-action@v5
-      with:
-        images: ghcr.io/${{ github.repository }}
 
     - name: Build and push Docker image
       uses: docker/build-push-action@v5
       with:
         context: .
         push: true
-        tags: ${{ steps.meta.outputs.tags }}
-        labels: ${{ steps.meta.outputs.labels }}
+        # 使用我们刚刚创建的全小写的 IMAGE_NAME 变量
+        tags: ghcr.io/${{ env.IMAGE_NAME }}:latest
