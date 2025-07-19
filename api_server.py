@@ -315,13 +315,18 @@ async def import_map(request: Request):
         raise HTTPException(status_code=401, detail="Invalid API Key")
     try:
         new_map = await request.json()
-        if not isinstance(new_map, dict): raise HTTPException(status_code=400, detail="Request body must be a valid JSON object.")
+        if not isinstance(new_map, dict): 
+            raise HTTPException(status_code=400, detail="Request body must be a valid JSON object.")
+        
         MODEL_ENDPOINT_MAP = new_map
-        logger.info(f"成功从API导入了 {len(MODEL_ENDPOINT_MAP)} 个模型端点映射！")
+        logger.info(f"✅ 成功从API导入了 {len(MODEL_ENDPOINT_MAP)} 个模型端点映射！")
+        
+        save_model_endpoint_map() # <-- 【【【核心修正】】】 在导入后立刻保存到临时文件
+        
         return {"status": "success", "message": f"Map imported with {len(MODEL_ENDPOINT_MAP)} entries."}
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
-
+        
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     global browser_ws, WARNED_UNKNOWN_IDS
@@ -624,9 +629,13 @@ async def get_admin_page(): # 确保这里没有 Depends(get_current_user)
             .container { max-width: 1200px; margin: auto; }
             .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1em; flex-wrap: wrap; gap: 1em;}
             h1 { color: #76a9fa; margin: 0;}
-            #export-btn { background-color: #388e3c; color: white; border: none; padding: 10px 15px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: background-color 0.2s; }
+            .button-group { display: flex; gap: 10px; }
+            .admin-btn { border: none; padding: 10px 15px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: background-color 0.2s; color: white; }
+            #export-btn { background-color: #388e3c; }
             #export-btn:hover { background-color: #2e7d32; }
-            #export-btn:disabled { background-color: #555; cursor: not-allowed; opacity: 0.7; }
+            #import-btn { background-color: #1976d2; }
+            #import-btn:hover { background-color: #115293; }
+            .admin-btn:disabled { background-color: #555; cursor: not-allowed; opacity: 0.7; }
             .model-group { background-color: #1e1e1e; border: 1px solid #383838; border-radius: 8px; margin-bottom: 2em; padding: 1.5em; overflow: hidden; }
             h2 { border-bottom: 1px solid #333; padding-bottom: 10px; }
             .endpoint-entry { background-color: #2a2b32; border-left: 4px solid #4a90e2; padding: 1em; margin-top: 1em; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1em; }
@@ -640,7 +649,11 @@ async def get_admin_page(): # 确保这里没有 Depends(get_current_user)
         <div class="container">
             <div class="header">
                 <h1>LMArena Bridge - ID 管理后台</h1>
-                <button id="export-btn" disabled>导出为JSON</button>
+                <div class="button-group">
+                    <button id="import-btn" class="admin-btn">导入JSON</button>
+                    <button id="export-btn" class="admin-btn" disabled>导出为JSON</button>
+                    <input type="file" id="import-file-input" accept=".json" style="display: none;">
+                </div>
             </div>
             <div id="data-container">
                 <div id="loading-state"><h2>🔄 正在加载数据...</h2></div>
@@ -648,35 +661,214 @@ async def get_admin_page(): # 确保这里没有 Depends(get_current_user)
         </div>
 
         <script>
-            let modelEndpointMapData = null; // 全局变量，用于存储从API获取的数据
+            let modelEndpointMapData = null;
             const exportButton = document.getElementById('export-btn');
+            const importButton = document.getElementById('import-btn');
+            const importFileInput = document.getElementById('import-file-input');
 
-            // --- 新增功能：导出JSON ---
-            exportButton.addEventListener('click', function() {
-                if (!modelEndpointMapData || Object.keys(modelEndpointMapData).length === 0) {
-                    alert('没有数据可导出！');
+            // --- 导出功能 ---
+            exportButton.addEventListener('click', function() { /* ... (此部分与上一版完全相同) ... */ });
+
+            // --- 【【【新增功能：导入JSON】】】 ---
+            importButton.addEventListener('click', () => importFileInput.click());
+            
+            importFileInput.addEventListener('change', async (event) => {
+                const file = event.target.files[0];
+                if (!file) return;
+
+                const apiKey = localStorage.getItem('adminApiKey');
+                if (!apiKey) { alert('认证信息丢失，请重新登录。'); return; }
+
+                if (!confirm(`确定要用文件 '${file.name}' 的内容覆盖服务器上所有的ID吗？此操作不可逆！`)) {
+                    importFileInput.value = ''; // 重置文件输入
                     return;
                 }
-                const dataStr = JSON.stringify(modelEndpointMapData, null, 2); // 格式化JSON
+
+                const reader = new FileReader();
+                reader.onload = async (e) => {
+                    try {
+                        const content = e.target.result;
+                        JSON.parse(content); // 验证一下是否是合法的JSON
+
+                        const response = await fetch('/v1/import-map', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Authorization': `Bearer ${apiKey}`
+                            },
+                            body: content
+                        });
+
+                        if (!response.ok) {
+                            const err = await response.json();
+                            throw new Error(err.detail || '导入失败');
+                        }
+                        
+                        alert('✅ 导入成功！页面将刷新以显示最新数据。');
+                        location.reload();
+
+                    } catch (error) {
+                        alert(`❌ 导入失败: ${error.message}. 请确保你上传的是一个合法的JSON文件。`);
+                    } finally {
+                         importFileInput.value = ''; // 无论成功失败都重置文件输入
+                    }
+                };
+                reader.readAsText(file);
+            });
+            
+            // --- 页面加载和渲染逻辑 (与上一版几乎完全相同) ---
+            // ... (将上一版回复中的完整 <script> 内容粘贴到这里) ...
+        </script>
+    </body>
+    </html>
+    """
+    # 为了保证代码的完整性，这里是完整的 <script> 标签内容
+    full_script = """
+        <script>
+            let modelEndpointMapData = null; // 全局变量，用于存储从API获取的数据
+            const exportButton = document.getElementById('export-btn');
+            const importButton = document.getElementById('import-btn');
+            const importFileInput = document.getElementById('import-file-input');
+
+            // --- 导出功能 ---
+            exportButton.addEventListener('click', function() {
+                if (!modelEndpointMapData || Object.keys(modelEndpointMapData).length === 0) {
+                    alert('没有数据可导出！'); return;
+                }
+                const dataStr = JSON.stringify(modelEndpointMapData, null, 2);
                 const dataBlob = new Blob([dataStr], { type: 'application/json;charset=utf-8' });
                 const url = URL.createObjectURL(dataBlob);
-                
                 const a = document.createElement('a');
+                const date = new Date().toISOString().slice(0, 10);
                 a.href = url;
-                const date = new Date().toISOString().slice(0, 10); // 获取 YYYY-MM-DD
-                a.download = `model_endpoint_map_${date}.json`; // 添加日期到文件名
+                a.download = `model_endpoint_map_${date}.json`;
                 document.body.appendChild(a);
-                a.click(); // 触发下载
+                a.click();
                 document.body.removeChild(a);
-                URL.revokeObjectURL(url); // 释放内存
+                URL.revokeObjectURL(url);
             });
 
-            // --- 原有逻辑 ---
+            // --- 导入功能 ---
+            importButton.addEventListener('click', () => importFileInput.click());
+            
+            importFileInput.addEventListener('change', (event) => {
+                const file = event.target.files[0];
+                if (!file) return;
+
+                const apiKey = localStorage.getItem('adminApiKey');
+                if (!apiKey) { alert('认证信息丢失，请重新登录。'); window.location.href = '/admin/login'; return; }
+
+                if (!confirm(`确定要用文件 '${file.name}' 的内容覆盖服务器上所有的ID吗？此操作不可逆！`)) {
+                    importFileInput.value = '';
+                    return;
+                }
+
+                const reader = new FileReader();
+                reader.onload = async (e) => {
+                    try {
+                        const content = e.target.result;
+                        JSON.parse(content); // 验证JSON合法性
+
+                        const response = await fetch('/v1/import-map', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+                            body: content
+                        });
+
+                        if (!response.ok) {
+                            if (response.status === 401) { alert('认证失败，请重新登录。'); window.location.href = '/admin/login'; return; }
+                            const err = await response.json();
+                            throw new Error(err.detail || '服务器返回未知错误。');
+                        }
+                        
+                        alert('✅ 导入成功！页面将刷新以显示最新数据。');
+                        location.reload();
+
+                    } catch (error) {
+                        alert(`❌ 导入失败: ${error.message}. 请确保上传的是合法的JSON文件。`);
+                    } finally {
+                         importFileInput.value = '';
+                    }
+                };
+                reader.readAsText(file);
+            });
+            
+            // --- 页面加载与渲染逻辑 ---
+            document.addEventListener('DOMContentLoaded', async function() {
+                // ... 与上一版完全相同
+            });
+            function renderData(data) {
+                // ... 与上一版完全相同
+            }
+            document.addEventListener('click', async function(event) {
+                // ... 与上一版完全相同
+            });
+        </script>
+    """
+    # 实际替换时，你应该用你已有的完整script替换上面注释掉的部分，然后再整合导入导出功能
+    # 为了让你直接可用，下面我将整合为一个完整的函数返回给你
+    
+    # 整合后的最终 HTML
+    final_html = html_content.split("<script>")[0] + """
+        <script>
+            let modelEndpointMapData = null;
+            const exportButton = document.getElementById('export-btn');
+            const importButton = document.getElementById('import-btn');
+            const importFileInput = document.getElementById('import-file-input');
+
+            exportButton.addEventListener('click', function() {
+                if (!modelEndpointMapData || Object.keys(modelEndpointMapData).length === 0) { alert('没有数据可导出！'); return; }
+                const dataStr = JSON.stringify(modelEndpointMapData, null, 2);
+                const dataBlob = new Blob([dataStr], { type: 'application/json;charset=utf-8' });
+                const url = URL.createObjectURL(dataBlob);
+                const a = document.createElement('a');
+                const date = new Date().toISOString().slice(0, 10);
+                a.href = url;
+                a.download = `model_endpoint_map_${date}.json`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+            });
+
+            importButton.addEventListener('click', () => importFileInput.click());
+            
+            importFileInput.addEventListener('change', (event) => {
+                const file = event.target.files[0];
+                if (!file) return;
+                const apiKey = localStorage.getItem('adminApiKey');
+                if (!apiKey) { alert('认证信息丢失，请重新登录。'); window.location.href = '/admin/login'; return; }
+                if (!confirm(`确定要用文件 '${file.name}' 的内容覆盖服务器上所有的ID吗？此操作不可逆！`)) { importFileInput.value = ''; return; }
+                const reader = new FileReader();
+                reader.onload = async (e) => {
+                    try {
+                        const content = e.target.result;
+                        JSON.parse(content);
+                        const response = await fetch('/v1/import-map', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+                            body: content
+                        });
+                        if (!response.ok) {
+                            if (response.status === 401) { alert('认证失败，请重新登录。'); window.location.href = '/admin/login'; return; }
+                            const err = await response.json();
+                            throw new Error(err.detail || '服务器返回未知错误。');
+                        }
+                        alert('✅ 导入成功！页面将刷新以显示最新数据。');
+                        location.reload();
+                    } catch (error) {
+                        alert(`❌ 导入失败: ${error.message}. 请确保上传的是合法的JSON文件。`);
+                    } finally {
+                         importFileInput.value = '';
+                    }
+                };
+                reader.readAsText(file);
+            });
+            
             document.addEventListener('DOMContentLoaded', async function() {
                 const apiKey = localStorage.getItem('adminApiKey');
                 const dataContainer = document.getElementById('data-container');
                 if (!apiKey) { window.location.href = '/admin/login'; return; }
-
                 try {
                     const response = await fetch('/v1/get-endpoint-map', { headers: { 'Authorization': `Bearer ${apiKey}` } });
                     if (response.status === 401) { alert('认证失败，请重新登录。'); localStorage.removeItem('adminApiKey'); window.location.href = '/admin/login'; return; }
@@ -690,19 +882,16 @@ async def get_admin_page(): # 确保这里没有 Depends(get_current_user)
             });
 
             function renderData(data) {
-                modelEndpointMapData = data; // 保存数据到全局变量
+                modelEndpointMapData = data;
                 const dataContainer = document.getElementById('data-container');
-                
                 if (Object.keys(data).length === 0) {
                     dataContainer.innerHTML = `<div id="empty-state"><h2>当前没有已捕获的ID。</h2></div>`;
-                    exportButton.disabled = true; // 如果没数据，禁用导出按钮
+                    exportButton.disabled = true;
                     return;
                 }
-                
-                exportButton.disabled = false; // 如果有数据，启用导出按钮
+                exportButton.disabled = false;
                 let html = '';
                 const sortedModelNames = Object.keys(data).sort();
-                // ... 此处开始的渲染逻辑与你文件中已有的完全相同 ...
                 for (const modelName of sortedModelNames) {
                     const endpoints = data[modelName];
                     html += `<div class="model-group" id="group-for-${modelName.replace(/[^a-zA-Z0-9]/g, '-') }"><h2>${modelName}</h2>`;
@@ -713,7 +902,7 @@ async def get_admin_page(): # 确保这里没有 Depends(get_current_user)
                         const mode = ep.mode || 'N/A';
                         const battleTarget = ep.battle_target;
                         const displayMode = mode === 'battle' && battleTarget ? `battle (target: ${battleTarget})` : mode;
-                        html += `
+                        html += \`
                         <div class="endpoint-entry" id="entry-${sessionId}">
                             <div class="endpoint-details">
                                 <strong>Session ID:</strong> ${sessionId}<br>
@@ -721,60 +910,52 @@ async def get_admin_page(): # 确保这里没有 Depends(get_current_user)
                                 <strong>Mode:</strong> ${displayMode}
                             </div>
                             <button class="delete-btn" data-model="${modelName}" data-session="${sessionId}">删除</button>
-                        </div>`;
+                        </div>\`;
                     }
-                    html += `</div>`;
+                    html += \`</div>\`;
                 }
                 dataContainer.innerHTML = html;
             }
-
+            
             document.addEventListener('click', async function(event) {
                 if (event.target.classList.contains('delete-btn')) {
                     const apiKey = localStorage.getItem('adminApiKey');
                     if (!apiKey) { alert('认证信息丢失，请重新登录。'); window.location.href = '/admin/login'; return; }
-                    
                     const button = event.target;
                     const modelName = button.dataset.model;
                     const sessionId = button.dataset.session;
-
-                    if (confirm(`确定要删除模型 '${modelName}' 下的这个 Session ID 吗？\\n${sessionId}`)) {
-                        // ... 删除逻辑与你文件中已有的完全相同 ...
+                    if (confirm(\`确定要删除模型 '${modelName}' 下的这个 Session ID 吗？\\n${sessionId}\`)) {
                         try {
                             const response = await fetch('/v1/delete-endpoint', {
                                 method: 'POST',
-                                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+                                headers: { 'Content-Type': 'application/json', 'Authorization': \`Bearer \${apiKey}\` },
                                 body: JSON.stringify({ modelName, sessionId })
                             });
-
                             if (!response.ok) {
                                 if (response.status === 401) { alert('认证失败，请重新登录。'); window.location.href = '/admin/login'; return; }
                                 const err = await response.json();
                                 throw new Error(err.detail || '服务器返回未知错误。');
                             }
-                            
-                            const entryElement = document.getElementById(`entry-${sessionId}`);
+                            const entryElement = document.getElementById(\`entry-\${sessionId}\`);
                             if (entryElement) {
                                 const modelGroup = entryElement.closest('.model-group');
-                                entryElement.remove(); // 简单移除
+                                entryElement.remove();
                                 if (modelGroup && !modelGroup.querySelector('.endpoint-entry')) {
                                     modelGroup.remove();
                                 }
-                                // 检查是否所有组都已删除
                                 if (document.querySelectorAll('.model-group').length === 0) {
-                                    renderData({}); // 重新渲染以显示空状态
+                                    renderData({});
                                 }
                             }
                         } catch (error) {
-                            alert(`删除失败: ${error.message}`);
+                            alert(\`删除失败: \${error.message}\`);
                         }
                     }
                 }
             });
         </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
+    """ + "</body></html>"
+    return HTMLResponse(content=final_html)
 
 if __name__ == "__main__":
     # 确保在运行前，存在 modules/payload_converter.py 文件
