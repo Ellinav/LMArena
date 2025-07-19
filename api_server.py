@@ -28,6 +28,7 @@ main_event_loop = None
 MODEL_NAME_TO_ID_MAP = {}
 MODEL_ENDPOINT_MAP = {}
 DEFAULT_MODEL_ID = "f44e280a-7914-43ca-a25d-ecfcc5d48d09"
+MAP_FILE_PATH = "/tmp/model_endpoint_map.json"
 
 class EndpointUpdatePayload(BaseModel):
     model_name: str = Field(..., alias='modelName')
@@ -36,27 +37,104 @@ class EndpointUpdatePayload(BaseModel):
     mode: str
     battle_target: Optional[str] = Field(None, alias='battleTarget')
 
+唉，我完全理解你的挫败感。我们已经尝试了所有标准的Docker权限修复方法，但问题依旧，这说明Hugging Face的运行环境确实有非常特殊的、严格的限制。
+
+你提供的这两条关于部署方式的信息是决定性的关键：
+
+GitHub Dockerfile: 这是你用来构建镜像的“蓝图”，包含了chown指令。
+
+HF Dockerfile: FROM ghcr.io/ellinav/ellina:main，这是HF实际执行的指令。
+
+这个流程本身是正确的。问题在于，即使你的镜像在构建时设置了正确的权限，HF在运行时也会用自己的一套安全机制覆盖掉这些权限，导致你的程序所在的/app目录最终还是只读的。
+
+最终结论是：Hugging Face平台禁止我们的程序写入工作目录(/app)下的任何文件，无论我们在Dockerfile里如何设置权限。
+
+既然正门不通，我们就走“窗户”。
+
+最终解决方案：绕过权限限制
+Linux系统有一个专门为程序设计的、保证可以随时写入的“公共草稿文件夹”—— /tmp 目录。我们将修改代码，把所有保存操作都指向这个/tmp目录，从而完全绕开HF的权限限制。
+
+第一步：还原Dockerfile
+首先，这个修改会让Dockerfile里的权限设置变得毫无意义。请删除你之前在Dockerfile中添加的chown或chmod那一行，把它恢复到最干净的状态。这样能避免未来的困惑。
+
+还原后的GitHub Dockerfile应该类似这样：
+
+Dockerfile
+
+FROM python:3.10-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+EXPOSE 7860
+CMD ["uvicorn", "api_server:app", "--host", "0.0.0.0", "--port", "7860"]
+第二步：修改20-api_serve.py以使用/tmp目录
+现在，我们对api_server.py进行三处精准的修改。
+
+1. 在文件顶部，定义临时文件的路径
+在文件的全局变量区域（大约第25行附近），添加一个常量来定义我们的新路径。
+
+Python
+
+# (这是第24行)
+DEFAULT_MODEL_ID = "f44e280a-7914-43ca-a25d-ecfcc5d48d09"
+MAP_FILE_PATH = "/tmp/model_endpoint_map.json" # <-- 在这里加上这一行
+2. 修改save_model_endpoint_map函数
+让这个函数往我们定义的新路径里写入文件。
+
+Python
+
+def save_model_endpoint_map():
+    """将内存中的MODEL_ENDPOINT_MAP字典保存回json文件。"""
+    try:
+        # vvvvvv 修改这一行 vvvvvv
+        with open(MAP_FILE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(MODEL_ENDPOINT_MAP, f, indent=2, ensure_ascii=False)
+        logger.info(f"✅ 成功将最新的ID地图保存到 {MAP_FILE_PATH}。") # (可选) 更新日志信息
+    except Exception as e:
+        logger.error(f"❌ 写入 {MAP_FILE_PATH} 文件时发生错误: {e}") # (可选) 更新日志信息
+3. 修改load_model_endpoint_map函数
+让这个函数变得更“聪明”。它会优先尝试从/tmp目录加载，如果找不到（说明是刚重启），再回头去加载项目自带的原始文件。请用下面的完整函数替换掉旧的load_model_endpoint_map函数。
+
+Python
+
 def load_model_endpoint_map():
     global MODEL_ENDPOINT_MAP
+    # 优先尝试从可写的 /tmp 目录加载上一次会话保存的最新状态
+    try:
+        with open(MAP_FILE_PATH, 'r', encoding='utf-8') as f:
+            content = f.read()
+            if not content.strip():
+                MODEL_ENDPOINT_MAP = {}
+            else:
+                MODEL_ENDPOINT_MAP = json.loads(content)
+            logger.info(f"成功从临时文件 '{MAP_FILE_PATH}' 加载了 {len(MODEL_ENDPOINT_MAP)} 个端点映射。")
+            return # 如果成功，直接返回
+    except (FileNotFoundError, json.JSONDecodeError):
+        # 如果在/tmp没找到文件，说明是冷启动，这是正常现象，继续往下走
+        pass
+
+    # 如果临时文件加载失败，则回退到从工作目录加载原始文件
     try:
         with open('model_endpoint_map.json', 'r', encoding='utf-8') as f:
             content = f.read()
-            if not content.strip(): MODEL_ENDPOINT_MAP = {}
-            else: MODEL_ENDPOINT_MAP = json.loads(content)
-        logger.info(f"成功从 'model_endpoint_map.json' 加载了 {len(MODEL_ENDPOINT_MAP)} 个模型端点映射。")
+            if not content.strip():
+                MODEL_ENDPOINT_MAP = {}
+            else:
+                MODEL_ENDPOINT_MAP = json.loads(content)
+            logger.info(f"从原始文件 'model_endpoint_map.json' 加载了 {len(MODEL_ENDPOINT_MAP)} 个端点映射。")
     except (FileNotFoundError, json.JSONDecodeError):
         MODEL_ENDPOINT_MAP = {}
 
 def save_model_endpoint_map():
     """将内存中的MODEL_ENDPOINT_MAP字典保存回json文件。"""
     try:
-        # 使用 'w' 模式来覆盖写入，确保文件内容是内存的最新快照
-        with open('model_endpoint_map.json', 'w', encoding='utf-8') as f:
-            # indent=2让JSON文件格式化，更易读
+        # vvvvvv 修改这一行 vvvvvv
+        with open(MAP_FILE_PATH, 'w', encoding='utf-8') as f:
             json.dump(MODEL_ENDPOINT_MAP, f, indent=2, ensure_ascii=False)
-        logger.info("✅ 成功将最新的ID地图保存到 model_endpoint_map.json。")
+        logger.info(f"✅ 成功将最新的ID地图保存到 {MAP_FILE_PATH}。") # (可选) 更新日志信息
     except Exception as e:
-        logger.error(f"❌ 写入 model_endpoint_map.json 文件时发生错误: {e}")
+        logger.error(f"❌ 写入 {MAP_FILE_PATH} 文件时发生错误: {e}") # (可选) 更新日志信息
 
 def load_config():
     global CONFIG
@@ -654,7 +732,7 @@ async def get_admin_page():
                 <h1>LMArena Bridge - ID 管理后台</h1>
                 <div class="button-group">
                     <button id="import-btn" class="admin-btn">导入JSON</button>
-                    <button id="export-btn" class="admin-btn" disabled>导出为JSON</button>
+                    <button id="export-btn" class="admin-btn" disabled>导出JSON</button>
                     <input type="file" id="import-file-input" accept=".json" style="display: none;">
                 </div>
             </div>
