@@ -619,82 +619,212 @@ async def get_admin_login_page():
 
 @app.get("/admin", response_class=HTMLResponse)
 async def get_admin_page():
-    # 这是一个极简化的版本，只包含加载和显示逻辑，用于调试
+    # 最终版：基于能正常工作的极简版，安全地添加了导入、导出和删除功能
     html_content = """
     <!DOCTYPE html>
     <html lang="zh">
     <head>
         <meta charset="UTF-8">
-        <title>LMArena Bridge - ID 管理后台 (调试模式)</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>LMArena Bridge - ID 管理后台</title>
         <style>
-            body { font-family: sans-serif; background-color: #121212; color: #e0e0e0; padding: 2em; }
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 2em; }
             .container { max-width: 1200px; margin: auto; }
-            h1 { color: #76a9fa; }
-            #data-container { margin-top: 2em; }
-            .model-group { background-color: #1e1e1e; border: 1px solid #383838; border-radius: 8px; margin-bottom: 1em; padding: 1.5em; }
+            .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1em; flex-wrap: wrap; gap: 1em;}
+            h1 { color: #76a9fa; margin: 0;}
+            .button-group { display: flex; gap: 10px; }
+            .admin-btn { border: none; padding: 10px 15px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: background-color 0.2s; color: white; }
+            #export-btn { background-color: #388e3c; }
+            #export-btn:hover { background-color: #2e7d32; }
+            #import-btn { background-color: #1976d2; }
+            #import-btn:hover { background-color: #115293; }
+            .admin-btn:disabled { background-color: #555; cursor: not-allowed; opacity: 0.7; }
+            .model-group { background-color: #1e1e1e; border: 1px solid #383838; border-radius: 8px; margin-bottom: 2em; padding: 1.5em; overflow: hidden; }
             h2 { border-bottom: 1px solid #333; padding-bottom: 10px; margin-top:0; }
-            .endpoint-entry { background-color: #2a2b32; padding: 1em; margin-top: 1em; }
-            .endpoint-details { font-family: monospace; white-space: pre-wrap; word-break: break-all; }
+            .endpoint-entry { background-color: #2a2b32; border-left: 4px solid #4a90e2; padding: 1em; margin-top: 1em; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1em; }
+            .endpoint-details { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; font-size: 0.9em; word-break: break-all; line-height: 1.6; }
+            .delete-btn { background-color: #da3633; color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; font-weight: bold; }
+            .delete-btn:hover { background-color: #b92521; }
             #loading-state, #empty-state, #error-state { text-align: center; margin-top: 3em; color: #888; }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>LMArena Bridge - ID 管理后台 (调试模式)</h1>
+            <div class="header">
+                <h1>LMArena Bridge - ID 管理后台</h1>
+                <div class="button-group">
+                    <button id="import-btn" class="admin-btn">导入JSON</button>
+                    <button id="export-btn" class="admin-btn" disabled>导出为JSON</button>
+                    <input type="file" id="import-file-input" accept=".json" style="display: none;">
+                </div>
+            </div>
             <div id="data-container">
                 <div id="loading-state"><h2>🔄 正在加载数据...</h2></div>
             </div>
         </div>
+
         <script>
-            document.addEventListener('DOMContentLoaded', async function() {
+            document.addEventListener('DOMContentLoaded', function() {
+                
+                let modelEndpointMapData = null;
+                const exportButton = document.getElementById('export-btn');
+                const importButton = document.getElementById('import-btn');
+                const importFileInput = document.getElementById('import-file-input');
                 const dataContainer = document.getElementById('data-container');
                 const apiKey = localStorage.getItem('adminApiKey');
 
-                if (!apiKey) {
-                    window.location.href = '/admin/login';
-                    return;
-                }
-
-                try {
-                    const response = await fetch('/v1/get-endpoint-map', {
-                        headers: { 'Authorization': `Bearer ${apiKey}` }
-                    });
-
-                    if (!response.ok) {
-                        throw new Error(`服务器响应错误: ${response.status} ${response.statusText}`);
+                // --- 导出功能 ---
+                exportButton.addEventListener('click', function() {
+                    if (!modelEndpointMapData || Object.keys(modelEndpointMapData).length === 0) {
+                        alert('没有数据可导出！'); return;
                     }
-                    
-                    const data = await response.json();
+                    const dataStr = JSON.stringify(modelEndpointMapData, null, 2);
+                    const dataBlob = new Blob([dataStr], { type: 'application/json;charset=utf-8' });
+                    const url = URL.createObjectURL(dataBlob);
+                    const a = document.createElement('a');
+                    const date = new Date().toISOString().slice(0, 10);
+                    a.href = url;
+                    a.download = `model_endpoint_map_${date}.json`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                });
 
+                // --- 导入功能 ---
+                importButton.addEventListener('click', () => importFileInput.click());
+                importFileInput.addEventListener('change', (event) => {
+                    const file = event.target.files[0];
+                    if (!file) return;
+                    if (!apiKey) { alert('认证信息丢失，请重新登录。'); window.location.href = '/admin/login'; return; }
+                    if (!confirm(`确定要用文件 '${file.name}' 的内容覆盖服务器上所有的ID吗？此操作不可逆！`)) {
+                        importFileInput.value = ''; return;
+                    }
+                    const reader = new FileReader();
+                    reader.onload = async (e) => {
+                        try {
+                            const content = e.target.result;
+                            JSON.parse(content);
+                            const response = await fetch('/v1/import-map', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+                                body: content
+                            });
+                            if (!response.ok) {
+                                if (response.status === 401) { alert('认证失败，请重新登录。'); window.location.href = '/admin/login'; return; }
+                                const err = await response.json();
+                                throw new Error(err.detail || '服务器返回未知错误。');
+                            }
+                            alert('✅ 导入成功！页面将刷新以显示最新数据。');
+                            location.reload();
+                        } catch (error) {
+                            alert(`❌ 导入失败: ${error.message}`);
+                        } finally {
+                            importFileInput.value = '';
+                        }
+                    };
+                    reader.readAsText(file);
+                });
+
+                // --- 删除功能 (事件委托) ---
+                dataContainer.addEventListener('click', async function(event) {
+                    if (event.target.classList.contains('delete-btn')) {
+                        if (!apiKey) { alert('认证信息丢失，请重新登录。'); window.location.href = '/admin/login'; return; }
+                        const button = event.target;
+                        const modelName = button.dataset.model;
+                        const sessionId = button.dataset.session;
+                        if (confirm(`确定要删除模型 '${modelName}' 下的这个 Session ID 吗？\\n${sessionId}`)) {
+                            try {
+                                const response = await fetch('/v1/delete-endpoint', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+                                    body: JSON.stringify({ modelName, sessionId })
+                                });
+                                if (!response.ok) {
+                                    if (response.status === 401) { alert('认证失败，请重新登录。'); window.location.href = '/admin/login'; return; }
+                                    const err = await response.json();
+                                    throw new Error(err.detail || '服务器返回未知错误。');
+                                }
+                                const entryElement = document.getElementById(`entry-${sessionId}`);
+                                if (entryElement) {
+                                    const modelGroup = entryElement.closest('.model-group');
+                                    entryElement.remove();
+                                    if (modelGroup && !modelGroup.querySelector('.endpoint-entry')) {
+                                        modelGroup.remove();
+                                    }
+                                    if (document.querySelectorAll('.model-group').length === 0) {
+                                        renderData({});
+                                    }
+                                }
+                            } catch (error) {
+                                alert(`删除失败: ${error.message}`);
+                            }
+                        }
+                    }
+                });
+
+                // --- 渲染函数 ---
+                function renderData(data) {
+                    modelEndpointMapData = data;
                     if (Object.keys(data).length === 0) {
-                        dataContainer.innerHTML = `<div id="empty-state"><h2>当前没有已捕获的ID。</h2></div>`;
+                        dataContainer.innerHTML = '<div id="empty-state"><h2>当前没有已捕获的ID。</h2></div>';
+                        exportButton.disabled = true;
                         return;
                     }
-
+                    exportButton.disabled = false;
                     let html = '';
-                    for (const modelName in data) {
-                        html += `<div class="model-group"><h2>${modelName}</h2>`;
+                    const sortedModelNames = Object.keys(data).sort();
+                    for (const modelName of sortedModelNames) {
+                        html += '<div class="model-group" id="group-for-' + modelName.replace(/[^a-zA-Z0-9]/g, '-') + '"><h2>' + modelName + '</h2>';
                         const endpoints = Array.isArray(data[modelName]) ? data[modelName] : [data[modelName]];
                         for (const ep of endpoints) {
-                            html += `<div class="endpoint-entry"><div class="endpoint-details">`;
-                            html += `<strong>Session ID:</strong> ${ep.sessionId || 'N/A'}<br>`;
-                            html += `<strong>Message ID:</strong> ${ep.messageId || 'N/A'}`;
-                            html += `</div></div>`;
+                            const sessionId = ep.sessionId || ep.session_id || 'N/A';
+                            const messageId = ep.messageId || ep.message_id || 'N/A';
+                            const mode = ep.mode || 'N/A';
+                            const battleTarget = ep.battle_target;
+                            const displayMode = mode === 'battle' && battleTarget ? `battle (target: ${battleTarget})` : mode;
+                            html += '<div class="endpoint-entry" id="entry-' + sessionId + '">' +
+                                        '<div class="endpoint-details">' +
+                                            '<strong>Session ID:</strong> ' + sessionId + '<br>' +
+                                            '<strong>Message ID:</strong> ' + messageId + '<br>' +
+                                            '<strong>Mode:</strong> ' + displayMode +
+                                        '</div>' +
+                                        '<button class="delete-btn" data-model="' + modelName + '" data-session="' + sessionId + '">删除</button>' +
+                                    '</div>';
                         }
-                        html += `</div>`;
+                        html += '</div>';
                     }
                     dataContainer.innerHTML = html;
-
-                } catch (error) {
-                    dataContainer.innerHTML = `<div id="error-state"><h2>❌ 加载数据失败</h2><p>${error.toString()}</p></div>`;
                 }
+                
+                // --- 启动函数：页面加载时获取初始数据 ---
+                async function initialLoad() {
+                    if (!apiKey) {
+                        window.location.href = '/admin/login';
+                        return;
+                    }
+                    try {
+                        const response = await fetch('/v1/get-endpoint-map', { headers: { 'Authorization': `Bearer ${apiKey}` } });
+                        if (!response.ok) {
+                             if (response.status === 401) { alert('认证失败，请重新登录。'); localStorage.removeItem('adminApiKey'); window.location.href = '/admin/login'; return; }
+                            throw new Error('获取数据失败，服务器状态: ' + response.status);
+                        }
+                        const data = await response.json();
+                        renderData(data);
+                    } catch (error) {
+                        dataContainer.innerHTML = `<div id="error-state"><h2>❌ 加载数据失败</h2><p>${error.toString()}</p></div>`;
+                        exportButton.disabled = true;
+                    }
+                }
+
+                initialLoad(); // 执行！
             });
         </script>
     </body>
     </html>
     """
     return HTMLResponse(content=html_content)
-    
+
 if __name__ == "__main__":
     # 确保在运行前，存在 modules/payload_converter.py 文件
     if not os.path.exists("modules/payload_converter.py"):
