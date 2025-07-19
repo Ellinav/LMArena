@@ -1,8 +1,12 @@
 name: Docker Image CI
 
 on:
+  # 当有代码推送到main分支时，自动运行
   push:
     branches: [ "main" ]
+  
+  # 新增：允许你在Actions页面手动触发此工作流
+  workflow_dispatch:
 
 jobs:
   build_and_push:
