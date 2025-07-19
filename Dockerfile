@@ -13,7 +13,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 开放 /app 文件夹内所有文件的写入权限，解决 Permission denied 问题
-RUN chmod -R a+w /app
+RUN chown -R 1000:1000 /app
 
 # 5. 将项目中的所有其他文件（.py, .json, .md 等）复制到工作目录
 COPY . .
